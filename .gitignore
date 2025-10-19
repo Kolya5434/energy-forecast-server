@@ -1,25 +1,47 @@
+# Python virtual environment
 .venv/
 venv/
 env/
 
-pycache/
+# Python cache and compiled files
+__pycache__/
 *.pyc
 *.pyo
 *.pyd
 
+# IDE configuration files (PyCharm, VSCode)
 .idea/
 .vscode/
 
-.ipynb_checkpoints
+# Jupyter Notebook checkpoints
 .ipynb_checkpoints/
 
+# Ignore everything in the data directory...
+data/*
+# ...except for the model results file
 !data/model_results.json
 
-!data/small_processed_data.csv
+# Ignore trained models (usually large binary files)
 models/
 
+# macOS system files
 .DS_Store
 
+# Build and distribution artifacts
 /dist/
 /build/
 *.egg-info/
+
+# Log files
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Local environment variables
+.env
+.env*
+*.local
