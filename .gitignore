@@ -13,7 +13,7 @@ pycache/
 .ipynb_checkpoints
 .ipynb_checkpoints/
 
-data/
+!data/model_results.json
 
 !data/small_processed_data.csv
 models/

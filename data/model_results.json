@@ -1,0 +1,38 @@
+{
+  "SARIMA": {
+    "accuracy_metrics": {
+      "MAE": 275.60,
+      "RMSE": 330.52,
+      "MAPE (%)": null,
+      "R²": -0.74,
+      "Explained Variance": -0.25
+    },
+    "performance_metrics": {
+      "avg_latency_ms": 1.64,
+      "memory_increment_mb": null
+    },
+    "interpretation": {
+      "feature_importance": null
+    }
+  },
+  "XGBoost_Tuned": {
+    "accuracy_metrics": {
+      "MAE": 166.51,
+      "RMSE": 212.49,
+      "MAPE (%)": null,
+      "R²": 0.28,
+      "Explained Variance": 0.30
+    },
+    "performance_metrics": {
+      "avg_latency_ms": 0.45,
+      "memory_increment_mb": 0.00
+    },
+    "interpretation": {
+      "feature_importance": {
+        "day_of_week": 0.87,
+        "day_of_year": 0.62,
+        "month": 0.01
+      }
+    }
+  }
+}
