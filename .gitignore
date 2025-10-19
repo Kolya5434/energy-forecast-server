@@ -20,6 +20,7 @@ __pycache__/
 data/*
 # ...except for the model results file
 !data/model_results.json
+!data/dataset_for_modeling.csv
 
 # Ignore trained models (usually large binary files)
 models/
