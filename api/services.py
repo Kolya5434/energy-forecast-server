@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 import joblib
 import json
@@ -6,6 +7,7 @@ import tensorflow as tf
 from typing import List, Dict, Any
 from prophet.serialize import model_from_json
 from fastapi import HTTPException
+import sklearn.ensemble
 
 from .config import AVAILABLE_MODELS, BASE_DIR
 from .schemas import PredictionRequest  # Імпортуємо схему запиту
@@ -269,9 +271,11 @@ def get_evaluation_service(model_id: str) -> Dict[str, Any]:
         print(f"Неочікувана помилка під час оцінки {model_id}: {e}")
         return {"error": f"Неочікувана помилка під час оцінки моделі '{model_id}'."}
 
-
 def get_interpretation_service(model_id: str) -> Dict[str, Any]:
-    """Повертає дані для інтерпретації для обраної моделі."""
+    """
+    Повертає дані для інтерпретації для обраної моделі,
+    включаючи feature_importance та SHAP values (якщо можливо).
+    """
     if model_id not in MODELS_CACHE:
         return {"error": f"Модель '{model_id}' не завантажена."}
 
@@ -279,12 +283,39 @@ def get_interpretation_service(model_id: str) -> Dict[str, Any]:
     if not model_config or model_config["type"] not in ["ml", "ensemble"]:
         return {"error": f"Інтерпретація недоступна для моделі типу '{model_config.get('type')}'."}
 
-    try:
-        # Динамічно імпортуємо SHAP
-        import shap
-        model = MODELS_CACHE[model_id]
+    model = MODELS_CACHE[model_id]
+    response: Dict[str, Any] = {"model_id": model_id}
 
-        # Готуємо дані для SHAP
+    feature_importance_dict = None
+    if hasattr(model, 'feature_importances_') and hasattr(model, 'feature_names_in_'):
+        try:
+            importances = model.feature_importances_
+            feature_names = model.feature_names_in_
+            importances_dict = {name: float(imp) for name, imp in zip(feature_names, importances)}
+            response["feature_importance"] = importances_dict
+        except Exception as fi_err:
+             print(f"Не вдалося отримати feature_importances_ для {model_id}: {fi_err}")
+             response["feature_importance"] = {"error": f"Не вдалося отримати feature importance: {fi_err}"}
+    else:
+        response["feature_importance"] = None
+
+
+    shap_explanation = None
+    shap_error = None
+    try:
+        import shap
+
+        is_tree_model = False
+        if hasattr(model, '_Booster'):
+            is_tree_model = True
+        elif 'sklearn' in globals() and isinstance(model, (sklearn.ensemble.RandomForestRegressor, sklearn.ensemble.GradientBoostingRegressor)):
+             is_tree_model = True
+
+        if not is_tree_model:
+            raise TypeError("SHAP TreeExplainer підтримує лише деревні моделі.")
+
+        explainer = shap.TreeExplainer(model)
+
         X_future = None
         if model_config["granularity"] == "daily" and model_config["feature_set"] == "simple":
             last_known_date = HISTORICAL_DATA_DAILY.index.max()
@@ -297,7 +328,7 @@ def get_interpretation_service(model_id: str) -> Dict[str, Any]:
             X_future = generate_full_features(history_slice, future_dates)
 
         if X_future is None:
-            return {"error": f"Розрахунок SHAP для конфігурації моделі '{model_id}' не реалізовано."}
+            raise NotImplementedError(f"Підготовка даних SHAP для конфігурації моделі '{model_id}' не реалізована.")
 
         if hasattr(model, 'feature_names_in_'):
             X_future = X_future[model.feature_names_in_]
@@ -309,35 +340,53 @@ def get_interpretation_service(model_id: str) -> Dict[str, Any]:
             if X_future.isnull().values.any():
                 raise ValueError("NaNs persist after fillna before SHAP")
 
-        explainer = shap.TreeExplainer(model)
-        shap_values = explainer.shap_values(X_future)
+        shap_values_output = explainer.shap_values(X_future.iloc[[0]])
 
-        # Перевірка результатів SHAP (може бути список або масив)
-        shap_contributions = shap_values[0] if isinstance(shap_values, list) else shap_values
+        if isinstance(shap_values_output, list):
+             if len(shap_values_output) > 0 and isinstance(shap_values_output[0], np.ndarray):
+                  shap_contributions = shap_values_output[0].flatten()
+             else:
+                  raise ValueError("Неочікуваний формат списку від shap_values")
+        elif isinstance(shap_values_output, np.ndarray):
+             shap_contributions = shap_values_output.flatten()
+        else:
+             raise ValueError(f"Неочікуваний тип результату від shap_values: {type(shap_values_output)}")
+
         if len(shap_contributions) != len(X_future.columns):
-            raise ValueError("Mismatch between SHAP values and feature count.")
+            raise ValueError(f"Розмірність SHAP values ({len(shap_contributions)}) не збігається з кількістю ознак ({len(X_future.columns)}).")
 
-        explanation = {
-            "shap_values": {
-                "base_value": float(explainer.expected_value),
-                "prediction_value": float(sum(shap_contributions) + explainer.expected_value),
-                "feature_contributions": {
-                    feature: float(value) for feature, value in zip(X_future.columns, shap_contributions)
-                }
+        shap_explanation = {
+            "base_value": float(explainer.expected_value),
+            "prediction_value": float(explainer.expected_value + sum(shap_contributions)),
+            "feature_contributions": {
+                feature: float(value) for feature, value in zip(X_future.columns, shap_contributions)
             }
         }
-        return explanation
 
     except ImportError:
-        return {"error": "Бібліотеку 'shap' не встановлено. Інтерпретація SHAP недоступна."}
+        shap_error = "Бібліотеку 'shap' не встановлено."
+        print(shap_error)
+    except TypeError as te:
+         shap_error = f"SHAP TreeExplainer не підходить: {te}"
+         print(f"SHAP Error for {model_id}: {shap_error}")
+    except NotImplementedError as nie:
+         shap_error = str(nie)
+         print(f"SHAP Error for {model_id}: {shap_error}")
     except Exception as e:
+        shap_error = f"Не вдалося розрахувати SHAP values: {e}"
         print(f"Помилка при розрахунку SHAP для {model_id}: {e}")
-        # Спробуємо повернути feature importance як fallback
-        if hasattr(model, 'feature_importances_') and hasattr(model, 'feature_names_in_'):
-            importances = model.feature_importances_
-            feature_names = model.feature_names_in_
-            # Перетворюємо numpy float32 на стандартний float
-            importances_dict = {name: float(imp) for name, imp in zip(feature_names, importances)}
-            return {"feature_importance": importances_dict}
 
-        return {"error": f"Не вдалося розрахувати інтерпретацію: {e}"}
+    if shap_explanation:
+        response["shap_values"] = shap_explanation
+    else:
+        response["shap_values"] = {"error": shap_error if shap_error else "Невідома помилка SHAP."}
+
+
+    has_fi = isinstance(response.get("feature_importance"), dict) and "error" not in response.get("feature_importance", {})
+    has_shap = isinstance(response.get("shap_values"), dict) and "error" not in response.get("shap_values", {})
+
+    if not has_fi and not has_shap:
+         final_error = response.get("shap_values", {}).get("error", "Не вдалося отримати жодних даних інтерпретації.")
+         return {"error": final_error}
+
+    return response
