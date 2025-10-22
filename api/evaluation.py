@@ -54,6 +54,38 @@ def _calculate_all_metrics(y_true: pd.Series, y_pred: np.ndarray) -> dict:
         "MAPE (%)": mape if mape != np.inf else None,
     }
 
+
+def _calculate_error_analysis(y_true: pd.Series, y_pred: np.ndarray) -> dict:
+    """
+    Розраховує дані для аналізу помилок (залишки в часі та по місяцях).
+    """
+    residuals_series = y_true - y_pred
+
+    residuals_over_time = residuals_series.reset_index()
+    residuals_over_time.columns = ['date', 'residual']
+    residuals_over_time['date'] = residuals_over_time['date'].dt.strftime('%Y-%m-%d')
+
+    residuals_df = pd.DataFrame({'residual': residuals_series, 'month': residuals_series.index.month})
+
+    monthly_stats = residuals_df.groupby('month')['residual'].describe(percentiles=[.25, .5, .75])
+
+    monthly_errors_df = pd.DataFrame({
+        'month': monthly_stats.index,
+        'min': monthly_stats['min'],
+        'q1': monthly_stats['25%'],
+        'median': monthly_stats['50%'],
+        'q3': monthly_stats['75%'],
+        'max': monthly_stats['max']
+    })
+
+    scatter_data = pd.DataFrame({'actual': y_true, 'predicted': y_pred}).reset_index(drop=True)
+
+    return {
+        "residuals_over_time": residuals_over_time.to_dict('records'),
+        "monthly_errors": monthly_errors_df.to_dict('records'),
+        "scatter_data": scatter_data.to_dict('records')
+    }
+
 # Updated function signature to accept data and models
 def evaluate_model(
     model_id: str,
@@ -137,9 +169,10 @@ def evaluate_model(
 
 
     metrics = _calculate_all_metrics(y_true, y_pred)
+    error_analysis_data = _calculate_error_analysis(y_true, y_pred)
 
     return {
         "model_id": model_id,
-        "accuracy_metrics": metrics
-        # Add performance metrics here if calculated within this function
+        "accuracy_metrics": metrics,
+        "error_analysis": error_analysis_data
     }
