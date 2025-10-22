@@ -237,17 +237,33 @@ def predict_service(request: PredictionRequest) -> List[Dict[str, Any]]:
     return results
 
 
+STATIC_PERFORMANCE_METRICS = {
+    "ARIMA": {"avg_latency_ms": 0.975800, "memory_increment_mb": 37.78},
+    "SARIMA": {"avg_latency_ms": 1.574268, "memory_increment_mb": 12.53},
+    "XGBoost_Tuned": {"avg_latency_ms": 0.776591, "memory_increment_mb": 8.03},
+    "LSTM": {"avg_latency_ms": 33.313401, "memory_increment_mb": 57.78},
+    "XGBoost": {"avg_latency_ms": 1.981492, "memory_increment_mb": 8.05},
+    "RandomForest": {"avg_latency_ms": 15.702372, "memory_increment_mb": 57.44},
+    "LightGBM": {"avg_latency_ms": 1.118460, "memory_increment_mb": 8.05},
+    "GRU": {"avg_latency_ms": 30.404129, "memory_increment_mb": None},
+    "Transformer": {"avg_latency_ms": 35.484061, "memory_increment_mb": 59.84},
+    "Voting": {"avg_latency_ms": 3.622100, "memory_increment_mb": 8.05},
+    "Stacking": {"avg_latency_ms": 3.477340, "memory_increment_mb": 8.06},
+    "Prophet": {"avg_latency_ms": 17.804852, "memory_increment_mb": 58.06},
+}
+
 def get_evaluation_service(model_id: str) -> Dict[str, Any]:
     """
-    Динамічно розраховує та повертає метрики якості для обраної моделі.
+    Dynamically calculates accuracy metrics and combines them with
+    static performance metrics for the selected model.
     """
     if model_id not in MODELS_CACHE:
-        return {"error": f"Модель '{model_id}' не завантажена."}
+         return {"error": f"Model '{model_id}' not loaded or unavailable."}
     if HISTORICAL_DATA_DAILY is None or HISTORICAL_DATA_HOURLY is None:
-        return {"error": "Історичні дані недоступні для оцінки."}
+         return {"error": "Historical data not available for evaluation."}
 
     try:
-        # Передаємо необхідні дані в функцію оцінки
+        # 1. Dynamically calculate accuracy metrics
         evaluation_results = evaluate_model(
             model_id=model_id,
             historical_data_daily=HISTORICAL_DATA_DAILY,
@@ -256,11 +272,11 @@ def get_evaluation_service(model_id: str) -> Dict[str, Any]:
             available_models=AVAILABLE_MODELS
         )
 
-        # Можна додати вимірювання latency тут, якщо потрібно
-        evaluation_results["performance_metrics"] = {
-            "avg_latency_ms": None,  # Placeholder
-            "memory_increment_mb": None  # Placeholder
-        }
+        static_metrics = STATIC_PERFORMANCE_METRICS.get(model_id, {
+            "avg_latency_ms": None, # Default if not found
+            "memory_increment_mb": None # Default if not found
+        })
+        evaluation_results["performance_metrics"] = static_metrics
 
         return evaluation_results
 
