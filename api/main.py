@@ -2,7 +2,7 @@ from fastapi import HTTPException, Request
 from typing import List
 
 from .config import app
-from .schemas import PredictionRequest, PredictionResponse
+from .schemas import PredictionRequest, PredictionResponse, SimulationRequest
 from . import services
 
 from fastapi.responses import JSONResponse
@@ -61,3 +61,19 @@ def get_interpretation(model_id: str):
     if "error" in result:
          raise HTTPException(status_code=404, detail=result["error"])
     return result
+
+@app.post("/api/simulate", response_model=PredictionResponse, summary="Запустити симуляцію прогнозу зі зміненими ознаками")
+def simulate_prediction(request: SimulationRequest):
+    """
+    Accepts the ID of a single model, the horizon, and a list of changed attributes.
+    Returns a single simulated forecast.
+    """
+    try:
+        response = services.simulate_service(request)
+        return response
+    except (KeyError, NotImplementedError, ValueError, FileNotFoundError) as e:
+        print(f"Помилка під час симуляції: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"Неочікувана помилка під час симуляції: {e}")
+        raise HTTPException(status_code=500, detail="Внутрішня помилка сервера під час симуляції.")

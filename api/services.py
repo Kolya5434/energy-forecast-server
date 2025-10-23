@@ -10,9 +10,9 @@ from fastapi import HTTPException
 import sklearn.ensemble
 
 from .config import AVAILABLE_MODELS, BASE_DIR
-from .schemas import PredictionRequest  # Імпортуємо схему запиту
+from .schemas import PredictionRequest, SimulationRequest
 from .features import generate_simple_features, generate_full_features, create_sequences_for_dl
-from .evaluation import evaluate_model  # Імпортуємо функцію оцінки
+from .evaluation import evaluate_model
 
 MODELS_CACHE: Dict[str, Any] = {}
 HISTORICAL_DATA_HOURLY = None
@@ -406,3 +406,95 @@ def get_interpretation_service(model_id: str) -> Dict[str, Any]:
          return {"error": final_error}
 
     return response
+
+
+def simulate_service(request: SimulationRequest) -> Dict[str, Any]:
+    """
+    Performs a forecast for ONE model, applying attribute changes.
+    """
+    model_id = request.model_id
+    horizon = request.forecast_horizon
+    overrides = request.feature_overrides
+
+    if model_id not in MODELS_CACHE:
+        raise KeyError(f"Модель '{model_id}' не завантажена або недоступна.")
+
+    model_config = AVAILABLE_MODELS[model_id]
+    model = MODELS_CACHE[model_id]
+
+    if model_config["feature_set"] == "none":
+        raise ValueError(
+            f"Симуляція недоступна для моделі '{model_id}', оскільки вона не використовує зовнішні ознаки.")
+    if model_config["type"] == "dl":
+        raise NotImplementedError("Симуляція для DL моделей наразі не реалізована.")
+
+    start_time = time.time()
+
+    X_future = None
+    future_dates = None
+
+    if model_config["granularity"] == "daily":
+        last_known_date = HISTORICAL_DATA_DAILY.index.max()
+        future_dates = pd.date_range(start=last_known_date + pd.Timedelta(days=1), periods=horizon, freq='D')
+        if model_config["feature_set"] == "simple":
+            X_future = generate_simple_features(future_dates)
+
+    elif model_config["granularity"] == "hourly":
+        last_known_date = HISTORICAL_DATA_HOURLY.index.max()
+        history_slice = HISTORICAL_DATA_HOURLY.tail(168)
+        future_dates = pd.date_range(start=last_known_date + pd.Timedelta(hours=1), periods=horizon * 24, freq='h')
+        if model_config["feature_set"] == "full":
+            X_future = generate_full_features(history_slice, future_dates)
+
+    if X_future is None:
+        raise NotImplementedError(f"Генерація ознак для симуляції моделі '{model_id}' не реалізована.")
+
+    print(f"Applying {len(overrides)} feature overrides...")
+    for override in overrides:
+        try:
+            date_to_change = pd.to_datetime(override.date)
+
+            target_rows = X_future.index.date == date_to_change.date()
+
+            if not np.any(target_rows):
+                print(f"Warning: Дата {override.date} не знайдена в горизонті прогнозу. Зміна проігнорована.")
+                continue
+
+            for feature, value in override.features.items():
+                if feature in X_future.columns:
+                    X_future.loc[target_rows, feature] = value
+                    print(f"   - Overridden '{feature}' on {override.date} to {value}")
+                else:
+                    print(f"Warning: Ознака '{feature}' не знайдена в моделі. Зміна проігнорована.")
+
+        except Exception as e:
+            print(f"Помилка при застосуванні зміни для дати {override.date}: {e}")
+
+    if hasattr(model, 'feature_names_in_'):
+        X_future = X_future[model.feature_names_in_]
+
+    if X_future.isnull().values.any():
+        print(f"Warning: NaNs detected in features for simulation. Filling with 0.")
+        X_future = X_future.fillna(0)
+
+    preds = model.predict(X_future)
+
+    if model_config["granularity"] == "hourly":
+        hourly_preds_series = pd.Series(preds, index=future_dates)
+        daily_preds = hourly_preds_series.resample('D').sum()
+        final_preds = daily_preds.values
+        final_dates = daily_preds.index
+    else:
+        final_preds = preds
+        final_dates = future_dates
+
+    forecast_values = {str(date.date()): float(pred) for date, pred in zip(final_dates, final_preds)}
+    end_time = time.time()
+
+    metadata = {"latency_ms": round((end_time - start_time) * 1000, 2), "simulated": True}
+
+    return {
+        "model_id": model_id,
+        "forecast": forecast_values,
+        "metadata": metadata
+    }
