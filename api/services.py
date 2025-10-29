@@ -8,6 +8,7 @@ from typing import List, Dict, Any
 from prophet.serialize import model_from_json
 from fastapi import HTTPException
 import sklearn.ensemble
+import functools
 
 from .config import AVAILABLE_MODELS, BASE_DIR
 from .schemas import PredictionRequest, SimulationRequest
@@ -17,6 +18,7 @@ from .evaluation import evaluate_model
 MODELS_CACHE: Dict[str, Any] = {}
 HISTORICAL_DATA_HOURLY = None
 HISTORICAL_DATA_DAILY = None
+_scaler = None
 
 try:
     print("Loading historical data...")
@@ -32,7 +34,6 @@ try:
     print("Historical data loaded successfully.")
 
     print("Loading models into cache...")
-    _scaler = None
     _scaler_path = BASE_DIR / "models/standard_scaler.pkl"
     if _scaler_path.exists():
         _scaler = joblib.load(_scaler_path)
@@ -48,19 +49,17 @@ try:
                 continue
 
             if config["type"] == "dl":
-                # Перевіряємо наявність TensorFlow
                 if 'tf' not in globals() or tf is None:
                     print(f"   - WARNING: TensorFlow not available. Skipping DL model: {model_id}")
                     continue
                 MODELS_CACHE[model_id] = tf.keras.models.load_model(model_path)
             elif model_id == "Prophet":
-                # Перевіряємо наявність Prophet
                 if 'model_from_json' not in globals() or model_from_json is None:
                     print(f"   - WARNING: Prophet library function not available. Skipping Prophet model.")
                     continue
                 with open(model_path, 'r') as f:
                     MODELS_CACHE[model_id] = model_from_json(json.load(f))
-            else:  # classical, ml, ensemble
+            else:
                 MODELS_CACHE[model_id] = joblib.load(model_path)
             print(f" - Loaded model: {model_id}")
         except ImportError as ie:
@@ -110,11 +109,10 @@ def predict_service(request: PredictionRequest) -> List[Dict[str, Any]]:
         forecast_values: Dict[str, Any] = {}
         preds = []
         final_preds = []
-        final_dates = pd.DatetimeIndex([])  # Ініціалізуємо як порожній DatetimeIndex
-        metadata = {}  # Ініціалізуємо метадані тут
+        final_dates = pd.DatetimeIndex([])
+        metadata = {}
 
         try:
-            # --- Логіка диспетчеризації та прогнозування ---
             if model_config["granularity"] == "daily":
                 future_dates = pd.date_range(start=last_known_date_daily + pd.Timedelta(days=1),
                                              periods=request.forecast_horizon, freq='D')
@@ -123,8 +121,10 @@ def predict_service(request: PredictionRequest) -> List[Dict[str, Any]]:
                     X_future = generate_simple_features(future_dates)
                     if hasattr(model, 'feature_names_in_'):
                         X_future = X_future[model.feature_names_in_]
-                    if X_future.isnull().values.any(): X_future = X_future.ffill().bfill()  # Basic NaN fill
-                    if X_future.isnull().values.any(): raise ValueError("NaNs in features after fill")
+                    if X_future.isnull().values.any():
+                        X_future = X_future.ffill().bfill()
+                    if X_future.isnull().values.any():
+                        raise ValueError("NaNs in features after fill")
                     preds = model.predict(X_future)
 
                 elif model_config["feature_set"] == "none":
@@ -132,7 +132,7 @@ def predict_service(request: PredictionRequest) -> List[Dict[str, Any]]:
                         future_df = pd.DataFrame({'ds': future_dates})
                         forecast = model.predict(future_df)
                         preds = forecast['yhat'].values
-                    else:  # ARIMA/SARIMA
+                    else:
                         preds = model.predict(n_periods=request.forecast_horizon)
 
                 final_preds, final_dates = preds, future_dates
@@ -144,19 +144,22 @@ def predict_service(request: PredictionRequest) -> List[Dict[str, Any]]:
                 hourly_predictions = []
 
                 if model_config.get("is_sequential"):  # DL Models
-                    # --- ТИМЧАСОВА ЗАГЛУШКА (закоментовано реальну логіку) ---
-                    print(f"Warning: Prediction for DL model '{model_id}' is temporarily disabled. Returning zeros.")
-                    hourly_predictions = [0.0] * num_hours
-                    # --- Кінець заглушки ---
-
-                    """ # --- Реальна логіка Walk-Forward (потребує ретельного тестування) ---
                     sequence_len = model_config["sequence_length"]
                     if _scaler is None:
                         raise HTTPException(status_code=500, detail="Scaler not loaded. Cannot predict with DL model.")
 
                     scaler_features = _scaler.get_feature_names_out()
                     target_col_name = 'Global_active_power'
-                    target_index_in_scaler = list(scaler_features).index(target_col_name)
+
+                    try:
+                        target_index_in_scaler = list(scaler_features).index(target_col_name)
+                    except ValueError:
+                        raise ValueError(f"Target column '{target_col_name}' not found in scaler features.")
+
+                    # Перевіряємо чи є всі необхідні колонки в історичних даних
+                    missing_cols = set(scaler_features) - set(HISTORICAL_DATA_HOURLY.columns)
+                    if missing_cols:
+                        raise ValueError(f"Historical data missing required columns: {missing_cols}")
 
                     current_history = HISTORICAL_DATA_HOURLY[scaler_features].iloc[-sequence_len:].copy()
 
@@ -178,10 +181,12 @@ def predict_service(request: PredictionRequest) -> List[Dict[str, Any]]:
                         next_timestamp = current_history.index[-1] + pd.Timedelta(hours=1)
                         new_row_df = pd.DataFrame([inversed_row], columns=scaler_features, index=[next_timestamp])
                         current_history = pd.concat([current_history.iloc[1:], new_row_df])
-                    """
+
+                        if (i + 1) % 24 == 0:
+                            print(f"  Progress: {i + 1}/{num_hours} hours predicted")
 
                 elif model_config["feature_set"] == "full":  # ML Models
-                    history_slice = HISTORICAL_DATA_HOURLY.tail(168)  # Need 1 week for max lag/window
+                    history_slice = HISTORICAL_DATA_HOURLY.tail(168)
                     X_future = generate_full_features(history_slice, future_dates_hourly)
 
                     if hasattr(model, 'feature_names_in_'):
@@ -196,11 +201,11 @@ def predict_service(request: PredictionRequest) -> List[Dict[str, Any]]:
 
                     if X_future.isnull().values.any():
                         print(f"Warning: NaNs detected in features for {model_id}. Filling with 0.")
-                        X_future = X_future.fillna(0)  # Fill NaNs
+                        X_future = X_future.fillna(0)
                         if X_future.isnull().values.any():
                             raise ValueError(f"NaNs persist after fillna for {model_id}")
 
-                    hourly_predictions = model.predict(X_future)  # Assign to hourly_predictions
+                    hourly_predictions = model.predict(X_future)
 
                 # --- Агрегація годинних до денних ---
                 if len(hourly_predictions) > 0:
@@ -208,29 +213,26 @@ def predict_service(request: PredictionRequest) -> List[Dict[str, Any]]:
                     daily_preds = hourly_preds_series.resample('D').sum()
                     final_preds = daily_preds.values
                     final_dates = daily_preds.index
-                else:  # Якщо прогноз не вдалося зробити (напр. DL заглушка була порожня)
+                else:
                     final_preds = []
                     final_dates = pd.date_range(start=last_known_date_daily + pd.Timedelta(days=1),
                                                 periods=request.forecast_horizon, freq='D')
 
-            # --- Форматування результату ТІЛЬКИ якщо прогноз успішний ---
-            # Перетворюємо numpy float32 на стандартний float Python
             forecast_values = {str(date.date()): float(pred) for date, pred in zip(final_dates, final_preds)}
 
         except Exception as pred_err:
             error_message = f"Помилка прогнозування для моделі {model_id}: {pred_err}"
             print(error_message)
-            forecast_values = {}  # Залишаємо forecast порожнім у разі помилки
-            metadata["error"] = error_message  # Додаємо помилку в метадані
+            forecast_values = {}
+            metadata["error"] = error_message
 
         end_time = time.time()
-
-        # --- Конструювання відповіді ---
         metadata["latency_ms"] = round((end_time - start_time) * 1000, 2)
+
         response_item = {
             "model_id": model_id,
             "forecast": forecast_values,
-            "metadata": metadata  # Використовуємо словник metadata
+            "metadata": metadata
         }
         results.append(response_item)
 
@@ -252,18 +254,15 @@ STATIC_PERFORMANCE_METRICS = {
     "Prophet": {"avg_latency_ms": 17.804852, "memory_increment_mb": 58.06},
 }
 
-def get_evaluation_service(model_id: str) -> Dict[str, Any]:
-    """
-    Dynamically calculates accuracy metrics and combines them with
-    static performance metrics for the selected model.
-    """
-    if model_id not in MODELS_CACHE:
-         return {"error": f"Model '{model_id}' not loaded or unavailable."}
-    if HISTORICAL_DATA_DAILY is None or HISTORICAL_DATA_HOURLY is None:
-         return {"error": "Historical data not available for evaluation."}
 
+# Caching for evaluation - stores up to 32 results
+@functools.lru_cache(maxsize=32)
+def _cached_evaluate_model(model_id: str) -> Dict[str, Any]:
+    """
+   Internal function with caching for model evaluation.
+   Accepts only hashable arguments (model_id).
+    """
     try:
-        # 1. Dynamically calculate accuracy metrics
         evaluation_results = evaluate_model(
             model_id=model_id,
             historical_data_daily=HISTORICAL_DATA_DAILY,
@@ -273,8 +272,8 @@ def get_evaluation_service(model_id: str) -> Dict[str, Any]:
         )
 
         static_metrics = STATIC_PERFORMANCE_METRICS.get(model_id, {
-            "avg_latency_ms": None, # Default if not found
-            "memory_increment_mb": None # Default if not found
+            "avg_latency_ms": None,
+            "memory_increment_mb": None
         })
         evaluation_results["performance_metrics"] = static_metrics
 
@@ -287,10 +286,24 @@ def get_evaluation_service(model_id: str) -> Dict[str, Any]:
         print(f"Неочікувана помилка під час оцінки {model_id}: {e}")
         return {"error": f"Неочікувана помилка під час оцінки моделі '{model_id}'."}
 
-def get_interpretation_service(model_id: str) -> Dict[str, Any]:
+
+def get_evaluation_service(model_id: str) -> Dict[str, Any]:
     """
-    Повертає дані для інтерпретації для обраної моделі,
-    включаючи feature_importance та SHAP values (якщо можливо).
+    Service function for evaluating a cached model.
+    Uses a cached function for fast access.
+    """
+    if model_id not in MODELS_CACHE:
+        return {"error": f"Model '{model_id}' not loaded or unavailable."}
+    if HISTORICAL_DATA_DAILY is None or HISTORICAL_DATA_HOURLY is None:
+        return {"error": "Historical data not available for evaluation."}
+
+    return _cached_evaluate_model(model_id)
+
+
+@functools.lru_cache(maxsize=32)
+def _cached_get_interpretation(model_id: str) -> Dict[str, Any]:
+    """
+    Internal caching function for model interpretation.
     """
     if model_id not in MODELS_CACHE:
         return {"error": f"Модель '{model_id}' не завантажена."}
@@ -302,7 +315,7 @@ def get_interpretation_service(model_id: str) -> Dict[str, Any]:
     model = MODELS_CACHE[model_id]
     response: Dict[str, Any] = {"model_id": model_id}
 
-    feature_importance_dict = None
+    # Feature Importance
     if hasattr(model, 'feature_importances_') and hasattr(model, 'feature_names_in_'):
         try:
             importances = model.feature_importances_
@@ -310,12 +323,12 @@ def get_interpretation_service(model_id: str) -> Dict[str, Any]:
             importances_dict = {name: float(imp) for name, imp in zip(feature_names, importances)}
             response["feature_importance"] = importances_dict
         except Exception as fi_err:
-             print(f"Не вдалося отримати feature_importances_ для {model_id}: {fi_err}")
-             response["feature_importance"] = {"error": f"Не вдалося отримати feature importance: {fi_err}"}
+            print(f"Не вдалося отримати feature_importances_ для {model_id}: {fi_err}")
+            response["feature_importance"] = {"error": f"Не вдалося отримати feature importance: {fi_err}"}
     else:
         response["feature_importance"] = None
 
-
+    # SHAP Values
     shap_explanation = None
     shap_error = None
     try:
@@ -324,8 +337,9 @@ def get_interpretation_service(model_id: str) -> Dict[str, Any]:
         is_tree_model = False
         if hasattr(model, '_Booster'):
             is_tree_model = True
-        elif 'sklearn' in globals() and isinstance(model, (sklearn.ensemble.RandomForestRegressor, sklearn.ensemble.GradientBoostingRegressor)):
-             is_tree_model = True
+        elif 'sklearn' in globals() and isinstance(model, (sklearn.ensemble.RandomForestRegressor,
+                                                           sklearn.ensemble.GradientBoostingRegressor)):
+            is_tree_model = True
 
         if not is_tree_model:
             raise TypeError("SHAP TreeExplainer підтримує лише деревні моделі.")
@@ -349,7 +363,6 @@ def get_interpretation_service(model_id: str) -> Dict[str, Any]:
         if hasattr(model, 'feature_names_in_'):
             X_future = X_future[model.feature_names_in_]
 
-        # Перевірка на NaN перед SHAP
         if X_future.isnull().values.any():
             print(f"Warning: NaNs detected in features for SHAP ({model_id}). Filling with 0.")
             X_future = X_future.fillna(0)
@@ -359,17 +372,18 @@ def get_interpretation_service(model_id: str) -> Dict[str, Any]:
         shap_values_output = explainer.shap_values(X_future.iloc[[0]])
 
         if isinstance(shap_values_output, list):
-             if len(shap_values_output) > 0 and isinstance(shap_values_output[0], np.ndarray):
-                  shap_contributions = shap_values_output[0].flatten()
-             else:
-                  raise ValueError("Неочікуваний формат списку від shap_values")
+            if len(shap_values_output) > 0 and isinstance(shap_values_output[0], np.ndarray):
+                shap_contributions = shap_values_output[0].flatten()
+            else:
+                raise ValueError("Неочікуваний формат списку від shap_values")
         elif isinstance(shap_values_output, np.ndarray):
-             shap_contributions = shap_values_output.flatten()
+            shap_contributions = shap_values_output.flatten()
         else:
-             raise ValueError(f"Неочікуваний тип результату від shap_values: {type(shap_values_output)}")
+            raise ValueError(f"Неочікуваний тип результату від shap_values: {type(shap_values_output)}")
 
         if len(shap_contributions) != len(X_future.columns):
-            raise ValueError(f"Розмірність SHAP values ({len(shap_contributions)}) не збігається з кількістю ознак ({len(X_future.columns)}).")
+            raise ValueError(
+                f"Розмірність SHAP values ({len(shap_contributions)}) не збігається з кількістю ознак ({len(X_future.columns)}).")
 
         shap_explanation = {
             "base_value": float(explainer.expected_value),
@@ -383,11 +397,11 @@ def get_interpretation_service(model_id: str) -> Dict[str, Any]:
         shap_error = "Бібліотеку 'shap' не встановлено."
         print(shap_error)
     except TypeError as te:
-         shap_error = f"SHAP TreeExplainer не підходить: {te}"
-         print(f"SHAP Error for {model_id}: {shap_error}")
+        shap_error = f"SHAP TreeExplainer не підходить: {te}"
+        print(f"SHAP Error for {model_id}: {shap_error}")
     except NotImplementedError as nie:
-         shap_error = str(nie)
-         print(f"SHAP Error for {model_id}: {shap_error}")
+        shap_error = str(nie)
+        print(f"SHAP Error for {model_id}: {shap_error}")
     except Exception as e:
         shap_error = f"Не вдалося розрахувати SHAP values: {e}"
         print(f"Помилка при розрахунку SHAP для {model_id}: {e}")
@@ -397,15 +411,22 @@ def get_interpretation_service(model_id: str) -> Dict[str, Any]:
     else:
         response["shap_values"] = {"error": shap_error if shap_error else "Невідома помилка SHAP."}
 
-
-    has_fi = isinstance(response.get("feature_importance"), dict) and "error" not in response.get("feature_importance", {})
+    has_fi = isinstance(response.get("feature_importance"), dict) and "error" not in response.get("feature_importance",
+                                                                                                  {})
     has_shap = isinstance(response.get("shap_values"), dict) and "error" not in response.get("shap_values", {})
 
     if not has_fi and not has_shap:
-         final_error = response.get("shap_values", {}).get("error", "Не вдалося отримати жодних даних інтерпретації.")
-         return {"error": final_error}
+        final_error = response.get("shap_values", {}).get("error", "Не вдалося отримати жодних даних інтерпретації.")
+        return {"error": final_error}
 
     return response
+
+
+def get_interpretation_service(model_id: str) -> Dict[str, Any]:
+    """
+    Service function for interpreting the model with caching.
+    """
+    return _cached_get_interpretation(model_id)
 
 
 def simulate_service(request: SimulationRequest) -> Dict[str, Any]:
@@ -453,7 +474,6 @@ def simulate_service(request: SimulationRequest) -> Dict[str, Any]:
     for override in overrides:
         try:
             date_to_change = pd.to_datetime(override.date)
-
             target_rows = X_future.index.date == date_to_change.date()
 
             if not np.any(target_rows):

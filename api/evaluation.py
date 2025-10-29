@@ -14,22 +14,23 @@ def _calculate_all_metrics(y_true: pd.Series, y_pred: np.ndarray) -> dict:
     if len(y_true_arr) != len(y_pred_arr):
         # This case should ideally not happen if data prep is correct
         # Try aligning based on index if possible, otherwise raise error
-        common_index = y_true.index.intersection(pd.Index(range(len(y_pred)))) # Example alignment, might need adjustment
+        common_index = y_true.index.intersection(pd.Index(range(len(y_pred))))
         if len(common_index) == 0:
-             raise ValueError(f"Length mismatch and index alignment failed: y_true ({len(y_true)}) vs y_pred ({len(y_pred)})")
+            raise ValueError(
+                f"Length mismatch and index alignment failed: y_true ({len(y_true)}) vs y_pred ({len(y_pred)})")
         y_true_arr = y_true.loc[common_index].values
         # Assuming y_pred corresponds to the same period, adjust its length/indices if needed
         # This part depends heavily on how y_pred indices align with y_true
         # Simplified: Assume y_pred corresponds directly if lengths match after potential alignment
-        if len(y_true_arr) != len(y_pred_arr): # Check length again after potential alignment
-             raise ValueError(f"Length mismatch after alignment: y_true ({len(y_true_arr)}) vs y_pred ({len(y_pred_arr)})")
+        if len(y_true_arr) != len(y_pred_arr):
+            raise ValueError(
+                f"Length mismatch after alignment: y_true ({len(y_true_arr)}) vs y_pred ({len(y_pred_arr)})")
 
-
-    mask = (y_true_arr != 0) & (~np.isnan(y_true_arr)) & (~np.isnan(y_pred_arr)) # More robust mask
+    mask = (y_true_arr != 0) & (~np.isnan(y_true_arr)) & (~np.isnan(y_pred_arr))
     y_true_masked = y_true_arr[mask]
     y_pred_masked = y_pred_arr[mask]
 
-    if len(y_true_masked) == 0: # Handle case where all true values are zero or NaN
+    if len(y_true_masked) == 0:
         mape = np.inf
     else:
         mape = np.mean(np.abs((y_true_masked - y_pred_masked) / y_true_masked)) * 100
@@ -37,14 +38,13 @@ def _calculate_all_metrics(y_true: pd.Series, y_pred: np.ndarray) -> dict:
     # Calculate other metrics using masked arrays where appropriate or original if NaNs handled earlier
     valid_indices = ~np.isnan(y_true_arr) & ~np.isnan(y_pred_arr)
     if not np.any(valid_indices):
-         return { # Return default/error values if no valid data points
+        return {
             "MAE": np.nan, "RMSE": np.nan, "R²": np.nan,
             "Explained Variance": np.nan, "MAPE (%)": np.nan
-         }
+        }
 
     y_true_valid = y_true_arr[valid_indices]
     y_pred_valid = y_pred_arr[valid_indices]
-
 
     return {
         "MAE": mean_absolute_error(y_true_valid, y_pred_valid),
@@ -86,14 +86,18 @@ def _calculate_error_analysis(y_true: pd.Series, y_pred: np.ndarray) -> dict:
         "scatter_data": scatter_data.to_dict('records')
     }
 
-# Updated function signature to accept data and models
+
+# Caching for the evaluate_model function - stores up to 32 results
+# IMPORTANT: For lru_cache to work, all arguments must be hashable
+# DataFrame is not hashable, so we only pass model_id,
+# and take the data from global variables in services.py
 def evaluate_model(
     model_id: str,
     historical_data_daily: pd.DataFrame,
     historical_data_hourly: pd.DataFrame,
     models_cache: Dict[str, Any],
-    available_models: Dict[str, Any] # Pass AVAILABLE_MODELS too
-    ) -> dict:
+    available_models: Dict[str, Any]
+) -> dict:
     """
     Dynamically evaluates a model by predicting on the test set.
     Accepts historical data and loaded models as arguments.
@@ -103,18 +107,17 @@ def evaluate_model(
     if historical_data_daily is None or historical_data_hourly is None:
         raise ValueError("Historical data not provided for evaluation.")
 
-
     model_config = available_models[model_id]
     model = models_cache[model_id]
 
     y_pred = []
-    y_true = pd.Series(dtype=float) # Initialize as float Series
+    y_true = pd.Series(dtype=float)
 
     # --- Dispatch evaluation logic ---
     if model_config["granularity"] == "daily":
         test_data = historical_data_daily.loc['2010-01-01':]
         if test_data.empty:
-             raise ValueError("No daily test data found for the evaluation period (2010 onwards).")
+            raise ValueError("No daily test data found for the evaluation period (2010 onwards).")
         y_true = test_data['Global_active_power']
 
         if model_config["feature_set"] == "simple":
@@ -123,7 +126,7 @@ def evaluate_model(
             if hasattr(model, 'feature_names_in_'):
                 X_test = X_test[model.feature_names_in_]
             y_pred = model.predict(X_test)
-        elif model_config["feature_set"] == "none": # ARIMA, Prophet
+        elif model_config["feature_set"] == "none":
             if model_id == "Prophet":
                  # Prophet needs 'ds' column
                 test_df_prophet = pd.DataFrame({'ds': test_data.index})
@@ -137,36 +140,36 @@ def evaluate_model(
     elif model_config["granularity"] == "hourly":
         test_data_hourly = historical_data_hourly.loc['2010-01-01':]
         if test_data_hourly.empty:
-             raise ValueError("No hourly test data found for the evaluation period (2010 onwards).")
+            raise ValueError("No hourly test data found for the evaluation period (2010 onwards).")
         y_true = test_data_hourly['Global_active_power']
 
         if model_config["feature_set"] == "full":
             history_for_features = historical_data_hourly.loc[:'2009-12-31']
             if history_for_features.empty:
-                 raise ValueError("No hourly history data found before 2010 for feature generation.")
+                raise ValueError("No hourly history data found before 2010 for feature generation.")
 
             X_test = generate_full_features(history_for_features, test_data_hourly.index)
             if hasattr(model, 'feature_names_in_'):
-                 X_test = X_test[model.feature_names_in_]
+                X_test = X_test[model.feature_names_in_]
             y_pred = model.predict(X_test)
-        else: # Includes DL models 'base_scaled'
-            raise NotImplementedError(f"Dynamic evaluation for hourly models with feature_set '{model_config['feature_set']}' ('{model_id}') is not implemented.")
+        else:
+            raise NotImplementedError(
+                f"Dynamic evaluation for hourly models with feature_set '{model_config['feature_set']}' ('{model_id}') is not implemented.")
 
     if len(y_pred) == 0:
         raise ValueError(f"Prediction array is empty for model '{model_id}'.")
-    if len(y_true) != len(y_pred):
-         # Add more specific check/logging
-         print(f"Warning/Error: Length mismatch for model {model_id}. y_true: {len(y_true)}, y_pred: {len(y_pred)}")
-         # Attempt to align based on index, assuming y_pred corresponds to y_true's index
-         try:
-             y_pred_series = pd.Series(y_pred, index=y_true.index[:len(y_pred)]) # Simple alignment attempt
-             y_true, y_pred_series = y_true.align(y_pred_series, join='inner') # Align strictly
-             y_pred = y_pred_series.values
-             if len(y_true) != len(y_pred): # Check again after alignment
-                  raise ValueError(f"Length mismatch persists after index alignment for {model_id}.")
-         except Exception as align_err:
-              raise ValueError(f"Length mismatch and alignment failed for model {model_id}: y_true ({len(y_true)}) vs y_pred ({len(y_pred)}). Error: {align_err}")
 
+    if len(y_true) != len(y_pred):
+        print(f"Warning/Error: Length mismatch for model {model_id}. y_true: {len(y_true)}, y_pred: {len(y_pred)}")
+        try:
+            y_pred_series = pd.Series(y_pred, index=y_true.index[:len(y_pred)])
+            y_true, y_pred_series = y_true.align(y_pred_series, join='inner')
+            y_pred = y_pred_series.values
+            if len(y_true) != len(y_pred):
+                raise ValueError(f"Length mismatch persists after index alignment for {model_id}.")
+        except Exception as align_err:
+            raise ValueError(
+                f"Length mismatch and alignment failed for model {model_id}: y_true ({len(y_true)}) vs y_pred ({len(y_pred)}). Error: {align_err}")
 
     metrics = _calculate_all_metrics(y_true, y_pred)
     error_analysis_data = _calculate_error_analysis(y_true, y_pred)

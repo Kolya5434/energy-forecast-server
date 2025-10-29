@@ -4,6 +4,7 @@ from typing import List
 from .config import app
 from .schemas import PredictionRequest, PredictionResponse, SimulationRequest
 from . import services
+from starlette.concurrency import run_in_threadpool
 
 from fastapi.responses import JSONResponse
 
@@ -11,7 +12,7 @@ from fastapi.responses import JSONResponse
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
     """Global handler for unexpected errors."""
-    print(f"Unhandled exception: {exc}") # Log the error
+    print(f"Unhandled exception: {exc}")
     return JSONResponse(
         status_code=500,
         content={
@@ -28,48 +29,59 @@ def get_models():
     return services.get_models_service()
 
 @app.post("/api/predict", response_model=List[PredictionResponse], summary="Generate forecasts using selected models")
-def predict(request: PredictionRequest):
+async def predict(request: PredictionRequest):
     """Accepts a list of model IDs and a forecast horizon, returns forecasts."""
     try:
-        response = services.predict_service(request)
-        if not response: # Handles case where all requested models failed or were not found
+        response = await run_in_threadpool(services.predict_service, request)
+        if not response:
             raise HTTPException(status_code=404, detail="No valid models found for prediction.")
         return response
     except FileNotFoundError as e:
          raise HTTPException(status_code=500, detail=f"Server configuration error: {e}")
     except ConnectionError as e:
          raise HTTPException(status_code=503, detail=f"Service unavailable: {e}")
-    except ValueError as e: # Catch feature mismatch errors etc.
+    except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Prediction error: {e}")
-    except Exception as e: # Catch-all for other prediction errors
-        # Re-raise to be caught by the global handler
+    except Exception as e:
         raise e
 
 
 @app.get("/api/evaluation/{model_id}", summary="Get evaluation metrics for a model")
-def get_evaluation(model_id: str):
+async def get_evaluation(model_id: str):
     """Returns performance and accuracy metrics from the results file."""
-    result = services.get_evaluation_service(model_id)
-    if "error" in result:
-        raise HTTPException(status_code=404, detail=result["error"])
-    return result
+    try:
+        result = await run_in_threadpool(services.get_evaluation_service, model_id)
+        if "error" in result:
+            raise HTTPException(status_code=404, detail=result.get("error", "Data not found."))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Помилка під час оцінки: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/interpret/{model_id}", summary="Get interpretation data for a model")
-def get_interpretation(model_id: str):
+async def get_interpretation(model_id: str):
     """Returns SHAP explanation or feature importance for the selected model."""
-    result = services.get_interpretation_service(model_id)
-    if "error" in result:
-         raise HTTPException(status_code=404, detail=result["error"])
-    return result
+    try:
+        result = await run_in_threadpool(services.get_interpretation_service, model_id)
+        if "error" in result:
+            raise HTTPException(status_code=404, detail=result["error"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Помилка під час інтерпретації: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/simulate", response_model=PredictionResponse, summary="Запустити симуляцію прогнозу зі зміненими ознаками")
-def simulate_prediction(request: SimulationRequest):
+async def simulate_prediction(request: SimulationRequest):
     """
     Accepts the ID of a single model, the horizon, and a list of changed attributes.
     Returns a single simulated forecast.
     """
     try:
-        response = services.simulate_service(request)
+        response = await run_in_threadpool(services.simulate_service, request)
         return response
     except (KeyError, NotImplementedError, ValueError, FileNotFoundError) as e:
         print(f"Помилка під час симуляції: {e}")
