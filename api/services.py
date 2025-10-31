@@ -18,7 +18,7 @@ from .evaluation import evaluate_model
 MODELS_CACHE: Dict[str, Any] = {}
 HISTORICAL_DATA_HOURLY = None
 HISTORICAL_DATA_DAILY = None
-_scaler = None
+_scaler = None  # Глобальний scaler для DL моделей
 
 try:
     print("Loading historical data...")
@@ -144,26 +144,31 @@ def predict_service(request: PredictionRequest) -> List[Dict[str, Any]]:
                 hourly_predictions = []
 
                 if model_config.get("is_sequential"):  # DL Models
+                    # Walk-Forward прогнозування для DL моделей
                     sequence_len = model_config["sequence_length"]
                     if _scaler is None:
-                        raise HTTPException(status_code=500, detail="Scaler not loaded. Cannot predict with DL model.")
+                        raise ValueError("Scaler not loaded. Cannot predict with DL model.")
 
-                    scaler_features = _scaler.get_feature_names_out()
+                    scaler_features = list(_scaler.get_feature_names_out())
                     target_col_name = 'Global_active_power'
 
                     try:
-                        target_index_in_scaler = list(scaler_features).index(target_col_name)
+                        target_index_in_scaler = scaler_features.index(target_col_name)
                     except ValueError:
                         raise ValueError(f"Target column '{target_col_name}' not found in scaler features.")
 
-                    # Перевіряємо чи є всі необхідні колонки в історичних даних
+                    # Перевірка наявності необхідних колонок
                     missing_cols = set(scaler_features) - set(HISTORICAL_DATA_HOURLY.columns)
                     if missing_cols:
                         raise ValueError(f"Historical data missing required columns: {missing_cols}")
 
                     current_history = HISTORICAL_DATA_HOURLY[scaler_features].iloc[-sequence_len:].copy()
 
-                    print(f"Starting walk-forward prediction for {model_id}...")
+                    if current_history.isnull().values.any():
+                        current_history = current_history.ffill().bfill().fillna(0)
+
+                    print(f"Starting walk-forward prediction for {model_id} ({num_hours} hours)...")
+
                     for i in range(num_hours):
                         input_scaled = _scaler.transform(current_history)
                         X_input = np.delete(input_scaled, target_index_in_scaler, axis=1)
@@ -171,19 +176,26 @@ def predict_service(request: PredictionRequest) -> List[Dict[str, Any]]:
 
                         pred_scaled = model.predict(X_input_reshaped, verbose=0)[0][0]
 
+                        if np.isnan(pred_scaled):
+                            pred_scaled = input_scaled[-1, target_index_in_scaler]
+
                         dummy_row_scaled = input_scaled[-1].copy()
                         dummy_row_scaled[target_index_in_scaler] = pred_scaled
                         inversed_row = _scaler.inverse_transform(dummy_row_scaled.reshape(1, -1))[0]
                         inversed_pred_value = inversed_row[target_index_in_scaler]
 
-                        hourly_predictions.append(inversed_pred_value)
+                        # Обробка некоректних значень
+                        if np.isnan(inversed_pred_value) or inversed_pred_value < 0:
+                            inversed_pred_value = 0.0
+
+                        hourly_predictions.append(float(inversed_pred_value))
 
                         next_timestamp = current_history.index[-1] + pd.Timedelta(hours=1)
                         new_row_df = pd.DataFrame([inversed_row], columns=scaler_features, index=[next_timestamp])
                         current_history = pd.concat([current_history.iloc[1:], new_row_df])
 
-                        if (i + 1) % 24 == 0:
-                            print(f"  Progress: {i + 1}/{num_hours} hours predicted")
+                        if (i + 1) % 48 == 0 or i == 0:
+                            print(f"  Progress: {i + 1}/{num_hours} hours")
 
                 elif model_config["feature_set"] == "full":  # ML Models
                     history_slice = HISTORICAL_DATA_HOURLY.tail(168)
