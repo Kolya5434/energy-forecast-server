@@ -1,14 +1,42 @@
 from fastapi import FastAPI
 from pathlib import Path
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 
-# Define the project's base directory for reliable path construction
+# Define the project's base directory
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifecycle manager: runs on startup and shutdown"""
+    print("🚀 Запуск сервера Energy Forecast API...")
+
+    try:
+        # 1. Завантажуємо моделі з Google Drive
+        from .utils import download_models_from_gdrive
+        download_models_from_gdrive()
+
+        # 2. Завантажуємо дані та моделі в пам'ять
+        from . import services
+        services.initialize_services()
+
+        print("✅ Всі компоненти готові до роботи!")
+
+    except Exception as e:
+        print(f"❌ ПОМИЛКА при ініціалізації: {e}")
+        print("   Сервер запуститься, але API може не працювати")
+
+    yield
+
+    print("🛑 Зупинка сервера...")
+
 
 app = FastAPI(
     title="Intelligent Hybrid Energy Consumption Forecasting System",
     description="Інтелектуальна гібридна система прогнозування споживання енергії для «розумних» міст.",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # Configure CORS to allow requests from your frontend

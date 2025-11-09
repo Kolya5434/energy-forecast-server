@@ -18,60 +18,71 @@ from .evaluation import evaluate_model
 MODELS_CACHE: Dict[str, Any] = {}
 HISTORICAL_DATA_HOURLY = None
 HISTORICAL_DATA_DAILY = None
-_scaler = None  # Глобальний scaler для DL моделей
+_scaler = None
 
-try:
-    print("Loading historical data...")
-    _hourly_data_path = BASE_DIR / "data/dataset_for_modeling.csv"
-    if not _hourly_data_path.exists():
-        raise FileNotFoundError(f"Historical data file not found at {_hourly_data_path}")
-    HISTORICAL_DATA_HOURLY = pd.read_csv(
-        _hourly_data_path,
-        index_col='DateTime',
-        parse_dates=True
-    )
-    HISTORICAL_DATA_DAILY = HISTORICAL_DATA_HOURLY['Global_active_power'].resample('D').sum().to_frame()
-    print("Historical data loaded successfully.")
 
-    print("Loading models into cache...")
-    _scaler_path = BASE_DIR / "models/standard_scaler.pkl"
-    if _scaler_path.exists():
-        _scaler = joblib.load(_scaler_path)
-        print(" - Scaler loaded.")
-    else:
-        print(" - WARNING: Scaler file not found. DL models might fail.")
+def initialize_services():
+    global MODELS_CACHE, HISTORICAL_DATA_HOURLY, HISTORICAL_DATA_DAILY, _scaler
 
-    for model_id, config in AVAILABLE_MODELS.items():
-        try:
-            model_path = config["path"]
-            if not model_path.exists():
-                print(f"   - WARNING: Model file not found for {model_id} at {model_path}. Skipping.")
-                continue
+    try:
+        print("Loading historical data...")
+        _hourly_data_path = BASE_DIR / "data/dataset_for_modeling.csv"
+        if not _hourly_data_path.exists():
+            raise FileNotFoundError(f"Historical data file not found at {_hourly_data_path}")
 
-            if config["type"] == "dl":
-                if 'tf' not in globals() or tf is None:
-                    print(f"   - WARNING: TensorFlow not available. Skipping DL model: {model_id}")
+        HISTORICAL_DATA_HOURLY = pd.read_csv(
+            _hourly_data_path,
+            index_col='DateTime',
+            parse_dates=True
+        )
+        HISTORICAL_DATA_DAILY = HISTORICAL_DATA_HOURLY['Global_active_power'].resample('D').sum().to_frame()
+        print("✅ Historical data loaded successfully.")
+
+        print("Loading scaler...")
+        _scaler_path = BASE_DIR / "models/standard_scaler.pkl"
+        if _scaler_path.exists():
+            _scaler = joblib.load(_scaler_path)
+            print("✅ Scaler loaded.")
+        else:
+            print("⚠️  WARNING: Scaler file not found. DL models might fail.")
+
+        print("Loading models into cache...")
+        for model_id, config in AVAILABLE_MODELS.items():
+            try:
+                model_path = config["path"]
+                if not model_path.exists():
+                    print(f"   ⚠️  Model file not found for {model_id} at {model_path}. Skipping.")
                     continue
-                MODELS_CACHE[model_id] = tf.keras.models.load_model(model_path)
-            elif model_id == "Prophet":
-                if 'model_from_json' not in globals() or model_from_json is None:
-                    print(f"   - WARNING: Prophet library function not available. Skipping Prophet model.")
-                    continue
-                with open(model_path, 'r') as f:
-                    MODELS_CACHE[model_id] = model_from_json(json.load(f))
-            else:
-                MODELS_CACHE[model_id] = joblib.load(model_path)
-            print(f" - Loaded model: {model_id}")
-        except ImportError as ie:
-            print(f"   - FAILED to load model {model_id} due to missing library: {ie}. Install required libraries.")
-        except Exception as load_err:
-            print(f"   - FAILED to load model {model_id}: {load_err}")
-    print(f"Model loading complete. {len(MODELS_CACHE)} models loaded successfully.")
 
-except FileNotFoundError as fnf_err:
-    print(f"CRITICAL ERROR: Data file missing: {fnf_err}")
-except Exception as startup_err:
-    print(f"CRITICAL ERROR during server startup: {startup_err}")
+                if config["type"] == "dl":
+                    if 'tf' not in globals() or tf is None:
+                        print(f"   ⚠️  TensorFlow not available. Skipping DL model: {model_id}")
+                        continue
+                    MODELS_CACHE[model_id] = tf.keras.models.load_model(model_path)
+                elif model_id == "Prophet":
+                    if 'model_from_json' not in globals() or model_from_json is None:
+                        print(f"   ⚠️  Prophet library function not available. Skipping Prophet model.")
+                        continue
+                    with open(model_path, 'r') as f:
+                        MODELS_CACHE[model_id] = model_from_json(json.load(f))
+                else:
+                    MODELS_CACHE[model_id] = joblib.load(model_path)
+                print(f"   ✅ Loaded model: {model_id}")
+            except ImportError as ie:
+                print(f"   ❌ FAILED to load model {model_id} due to missing library: {ie}")
+            except Exception as load_err:
+                print(f"   ❌ FAILED to load model {model_id}: {load_err}")
+
+        print(f"✅ Model loading complete. {len(MODELS_CACHE)} models loaded successfully.")
+
+    except FileNotFoundError as fnf_err:
+        print(f"❌ CRITICAL ERROR: Data file missing: {fnf_err}")
+        raise
+    except Exception as startup_err:
+        print(f"❌ CRITICAL ERROR during services initialization: {startup_err}")
+        raise
+
+
 
 
 def get_models_service() -> Dict[str, Any]:
