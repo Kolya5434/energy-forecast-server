@@ -89,3 +89,13 @@ async def simulate_prediction(request: SimulationRequest):
     except Exception as e:
         print(f"Неочікувана помилка під час симуляції: {e}")
         raise HTTPException(status_code=500, detail="Внутрішня помилка сервера під час симуляції.")
+
+@app.get("/")
+def root():
+    """Root endpoint - швидкий відгук без моделей"""
+    return {"message": "Energy Forecast API is running"}
+
+@app.get("/health")
+def health():
+    """Health check для моніторингу"""
+    return {"status": "healthy"}
