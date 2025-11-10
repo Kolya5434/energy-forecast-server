@@ -13,9 +13,9 @@ async def lifespan(app: FastAPI):
     print("🚀 Запуск сервера Energy Forecast API...")
 
     try:
-        # 1. Завантажуємо моделі з Google Drive
-        from .utils import download_models_from_gdrive
-        download_models_from_gdrive()
+        # 1. Завантажуємо моделі з Hugging Face
+        from .utils import download_models_from_hf
+        download_models_from_hf()
 
         # 2. Завантажуємо дані та моделі в пам'ять
         from . import services
