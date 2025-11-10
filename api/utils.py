@@ -1,5 +1,6 @@
 from huggingface_hub import hf_hub_download
 from pathlib import Path
+import os
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 MODELS_DIR = BASE_DIR / "models"
@@ -36,7 +37,6 @@ def download_models_from_hf():
         )
         if len(model_files) >= 12:
             print(f"✅ Моделі вже є ({len(model_files)} файлів)")
-            print(f"📁 Шлях: {MODELS_DIR}")
             return
 
     print("📥 Завантаження моделей з Hugging Face Hub...")
@@ -58,13 +58,11 @@ def download_models_from_hf():
                 local_dir_use_symlinks=False
             )
 
-        print("✅ Всі моделі успішно завантажені з Hugging Face!")
+        print("✅ Всі моделі успішно завантажені!")
 
         files = list(MODELS_DIR.glob("*"))
         print(f"📦 Завантажено файлів: {len(files)}")
-        for f in sorted(files):
-            print(f"  - {f.name}")
 
     except Exception as e:
-        print(f"❌ Помилка завантаження моделей з Hugging Face: {e}")
+        print(f"❌ Помилка завантаження: {e}")
         raise
