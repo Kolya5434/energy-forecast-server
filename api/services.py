@@ -9,11 +9,16 @@ from prophet.serialize import model_from_json
 from fastapi import HTTPException
 import sklearn.ensemble
 import functools
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
 
 from .config import AVAILABLE_MODELS, BASE_DIR
 from .schemas import PredictionRequest, SimulationRequest
 from .features import generate_simple_features, generate_full_features, create_sequences_for_dl
 from .evaluation import evaluate_model
+
+logger = logging.getLogger(__name__)
 
 MODELS_CACHE: Dict[str, Any] = {}
 HISTORICAL_DATA_HOURLY = None
@@ -94,170 +99,219 @@ def get_models_service() -> Dict[str, Any]:
             for mid in loaded_model_ids if mid in AVAILABLE_MODELS}
 
 
+def _predict_single_model(
+    model_id: str,
+    forecast_horizon: int,
+    last_known_date_hourly: pd.Timestamp,
+    last_known_date_daily: pd.Timestamp
+) -> Dict[str, Any]:
+    """
+    Executes prediction for a single model.
+    This function is extracted for parallel execution via ThreadPoolExecutor.
+    """
+    if model_id not in MODELS_CACHE:
+        logger.warning(f"Model {model_id} requested but not loaded/available. Skipping.")
+        return {
+            "model_id": model_id,
+            "forecast": {},
+            "metadata": {"error": "Model not loaded or unavailable."}
+        }
+
+    start_time = time.time()
+    model_config = AVAILABLE_MODELS[model_id]
+    model = MODELS_CACHE[model_id]
+
+    forecast_values: Dict[str, Any] = {}
+    preds = []
+    final_preds = []
+    final_dates = pd.DatetimeIndex([])
+    metadata = {}
+
+    try:
+        if model_config["granularity"] == "daily":
+            future_dates = pd.date_range(start=last_known_date_daily + pd.Timedelta(days=1),
+                                         periods=forecast_horizon, freq='D')
+
+            if model_config["feature_set"] == "simple":
+                X_future = generate_simple_features(future_dates)
+                if hasattr(model, 'feature_names_in_'):
+                    X_future = X_future[model.feature_names_in_]
+                if X_future.isnull().values.any():
+                    X_future = X_future.ffill().bfill()
+                if X_future.isnull().values.any():
+                    raise ValueError("NaNs in features after fill")
+                preds = model.predict(X_future)
+
+            elif model_config["feature_set"] == "none":
+                if model_id == "Prophet":
+                    future_df = pd.DataFrame({'ds': future_dates})
+                    forecast = model.predict(future_df)
+                    preds = forecast['yhat'].values
+                else:
+                    preds = model.predict(n_periods=forecast_horizon)
+
+            final_preds, final_dates = preds, future_dates
+
+        elif model_config["granularity"] == "hourly":
+            num_hours = forecast_horizon * 24
+            future_dates_hourly = pd.date_range(start=last_known_date_hourly + pd.Timedelta(hours=1),
+                                                periods=num_hours, freq='h')
+            hourly_predictions = []
+
+            if model_config.get("is_sequential"):  # DL Models
+                # Walk-Forward прогнозування для DL моделей
+                sequence_len = model_config["sequence_length"]
+                if _scaler is None:
+                    raise ValueError("Scaler not loaded. Cannot predict with DL model.")
+
+                scaler_features = list(_scaler.get_feature_names_out())
+                target_col_name = 'Global_active_power'
+
+                try:
+                    target_index_in_scaler = scaler_features.index(target_col_name)
+                except ValueError:
+                    raise ValueError(f"Target column '{target_col_name}' not found in scaler features.")
+
+                # Перевірка наявності необхідних колонок
+                missing_cols = set(scaler_features) - set(HISTORICAL_DATA_HOURLY.columns)
+                if missing_cols:
+                    raise ValueError(f"Historical data missing required columns: {missing_cols}")
+
+                current_history = HISTORICAL_DATA_HOURLY[scaler_features].iloc[-sequence_len:].copy()
+
+                if current_history.isnull().values.any():
+                    current_history = current_history.ffill().bfill().fillna(0)
+
+                logger.info(f"Starting walk-forward prediction for {model_id} ({num_hours} hours)...")
+
+                for i in range(num_hours):
+                    input_scaled = _scaler.transform(current_history)
+                    X_input = np.delete(input_scaled, target_index_in_scaler, axis=1)
+                    X_input_reshaped = np.expand_dims(X_input, axis=0)
+
+                    pred_scaled = model.predict(X_input_reshaped, verbose=0)[0][0]
+
+                    if np.isnan(pred_scaled):
+                        pred_scaled = input_scaled[-1, target_index_in_scaler]
+
+                    dummy_row_scaled = input_scaled[-1].copy()
+                    dummy_row_scaled[target_index_in_scaler] = pred_scaled
+                    inversed_row = _scaler.inverse_transform(dummy_row_scaled.reshape(1, -1))[0]
+                    inversed_pred_value = inversed_row[target_index_in_scaler]
+
+                    # Обробка некоректних значень
+                    if np.isnan(inversed_pred_value) or inversed_pred_value < 0:
+                        inversed_pred_value = 0.0
+
+                    hourly_predictions.append(float(inversed_pred_value))
+
+                    next_timestamp = current_history.index[-1] + pd.Timedelta(hours=1)
+                    new_row_df = pd.DataFrame([inversed_row], columns=scaler_features, index=[next_timestamp])
+                    current_history = pd.concat([current_history.iloc[1:], new_row_df])
+
+                    if (i + 1) % 48 == 0 or i == 0:
+                        logger.info(f"  Progress ({model_id}): {i + 1}/{num_hours} hours")
+
+            elif model_config["feature_set"] == "full":  # ML Models
+                history_slice = HISTORICAL_DATA_HOURLY.tail(168)
+                X_future = generate_full_features(history_slice, future_dates_hourly)
+
+                if hasattr(model, 'feature_names_in_'):
+                    expected_cols = model.feature_names_in_
+                    missing_in_future = set(expected_cols) - set(X_future.columns)
+                    if missing_in_future:
+                        raise ValueError(f"Feature generation missed expected columns: {missing_in_future}")
+                    extra_in_future = set(X_future.columns) - set(expected_cols)
+                    if extra_in_future:
+                        X_future = X_future.drop(columns=list(extra_in_future))
+                    X_future = X_future[expected_cols]
+
+                if X_future.isnull().values.any():
+                    logger.warning(f"NaNs detected in features for {model_id}. Filling with 0.")
+                    X_future = X_future.fillna(0)
+                    if X_future.isnull().values.any():
+                        raise ValueError(f"NaNs persist after fillna for {model_id}")
+
+                hourly_predictions = model.predict(X_future)
+
+            # --- Агрегація годинних до денних ---
+            if len(hourly_predictions) > 0:
+                hourly_preds_series = pd.Series(hourly_predictions, index=future_dates_hourly)
+                daily_preds = hourly_preds_series.resample('D').sum()
+                final_preds = daily_preds.values
+                final_dates = daily_preds.index
+            else:
+                final_preds = []
+                final_dates = pd.date_range(start=last_known_date_daily + pd.Timedelta(days=1),
+                                            periods=forecast_horizon, freq='D')
+
+        forecast_values = {str(date.date()): float(pred) for date, pred in zip(final_dates, final_preds)}
+
+    except Exception as pred_err:
+        error_message = f"Помилка прогнозування для моделі {model_id}: {pred_err}"
+        logger.error(error_message)
+        forecast_values = {}
+        metadata["error"] = error_message
+
+    end_time = time.time()
+    metadata["latency_ms"] = round((end_time - start_time) * 1000, 2)
+
+    response_item = {
+        "model_id": model_id,
+        "forecast": forecast_values,
+        "metadata": metadata
+    }
+    return response_item
+
+
 def predict_service(request: PredictionRequest) -> List[Dict[str, Any]]:
-    """Виконує прогнозування для списку моделей, враховуючи їхні вимоги."""
+    """
+    Виконує прогнозування для списку моделей, враховуючи їхні вимоги.
+
+    Uses parallel execution with ThreadPoolExecutor for faster predictions.
+    """
     if not MODELS_CACHE or HISTORICAL_DATA_HOURLY is None or HISTORICAL_DATA_DAILY is None:
         raise HTTPException(status_code=503, detail="Сервіс недоступний: Моделі або історичні дані не завантажено.")
 
-    results = []
     last_known_date_hourly = HISTORICAL_DATA_HOURLY.index.max()
     last_known_date_daily = HISTORICAL_DATA_DAILY.index.max()
 
-    for model_id in request.model_ids:
-        if model_id not in MODELS_CACHE:
-            print(f"Warning: Model {model_id} requested but not loaded/available. Skipping.")
-            results.append({
-                "model_id": model_id,
-                "forecast": {},
-                "metadata": {"error": "Model not loaded or unavailable."}
-            })
-            continue
+    # Determine optimal number of workers based on CPU cores
+    # Use min(cpu_count, num_models) to avoid creating unnecessary threads
+    max_workers = min(os.cpu_count() or 4, len(request.model_ids))
 
-        start_time = time.time()
-        model_config = AVAILABLE_MODELS[model_id]
-        model = MODELS_CACHE[model_id]
+    logger.info(f"Starting parallel predictions for {len(request.model_ids)} models with {max_workers} workers")
 
-        forecast_values: Dict[str, Any] = {}
-        preds = []
-        final_preds = []
-        final_dates = pd.DatetimeIndex([])
-        metadata = {}
+    results = []
 
-        try:
-            if model_config["granularity"] == "daily":
-                future_dates = pd.date_range(start=last_known_date_daily + pd.Timedelta(days=1),
-                                             periods=request.forecast_horizon, freq='D')
-
-                if model_config["feature_set"] == "simple":
-                    X_future = generate_simple_features(future_dates)
-                    if hasattr(model, 'feature_names_in_'):
-                        X_future = X_future[model.feature_names_in_]
-                    if X_future.isnull().values.any():
-                        X_future = X_future.ffill().bfill()
-                    if X_future.isnull().values.any():
-                        raise ValueError("NaNs in features after fill")
-                    preds = model.predict(X_future)
-
-                elif model_config["feature_set"] == "none":
-                    if model_id == "Prophet":
-                        future_df = pd.DataFrame({'ds': future_dates})
-                        forecast = model.predict(future_df)
-                        preds = forecast['yhat'].values
-                    else:
-                        preds = model.predict(n_periods=request.forecast_horizon)
-
-                final_preds, final_dates = preds, future_dates
-
-            elif model_config["granularity"] == "hourly":
-                num_hours = request.forecast_horizon * 24
-                future_dates_hourly = pd.date_range(start=last_known_date_hourly + pd.Timedelta(hours=1),
-                                                    periods=num_hours, freq='h')
-                hourly_predictions = []
-
-                if model_config.get("is_sequential"):  # DL Models
-                    # Walk-Forward прогнозування для DL моделей
-                    sequence_len = model_config["sequence_length"]
-                    if _scaler is None:
-                        raise ValueError("Scaler not loaded. Cannot predict with DL model.")
-
-                    scaler_features = list(_scaler.get_feature_names_out())
-                    target_col_name = 'Global_active_power'
-
-                    try:
-                        target_index_in_scaler = scaler_features.index(target_col_name)
-                    except ValueError:
-                        raise ValueError(f"Target column '{target_col_name}' not found in scaler features.")
-
-                    # Перевірка наявності необхідних колонок
-                    missing_cols = set(scaler_features) - set(HISTORICAL_DATA_HOURLY.columns)
-                    if missing_cols:
-                        raise ValueError(f"Historical data missing required columns: {missing_cols}")
-
-                    current_history = HISTORICAL_DATA_HOURLY[scaler_features].iloc[-sequence_len:].copy()
-
-                    if current_history.isnull().values.any():
-                        current_history = current_history.ffill().bfill().fillna(0)
-
-                    print(f"Starting walk-forward prediction for {model_id} ({num_hours} hours)...")
-
-                    for i in range(num_hours):
-                        input_scaled = _scaler.transform(current_history)
-                        X_input = np.delete(input_scaled, target_index_in_scaler, axis=1)
-                        X_input_reshaped = np.expand_dims(X_input, axis=0)
-
-                        pred_scaled = model.predict(X_input_reshaped, verbose=0)[0][0]
-
-                        if np.isnan(pred_scaled):
-                            pred_scaled = input_scaled[-1, target_index_in_scaler]
-
-                        dummy_row_scaled = input_scaled[-1].copy()
-                        dummy_row_scaled[target_index_in_scaler] = pred_scaled
-                        inversed_row = _scaler.inverse_transform(dummy_row_scaled.reshape(1, -1))[0]
-                        inversed_pred_value = inversed_row[target_index_in_scaler]
-
-                        # Обробка некоректних значень
-                        if np.isnan(inversed_pred_value) or inversed_pred_value < 0:
-                            inversed_pred_value = 0.0
-
-                        hourly_predictions.append(float(inversed_pred_value))
-
-                        next_timestamp = current_history.index[-1] + pd.Timedelta(hours=1)
-                        new_row_df = pd.DataFrame([inversed_row], columns=scaler_features, index=[next_timestamp])
-                        current_history = pd.concat([current_history.iloc[1:], new_row_df])
-
-                        if (i + 1) % 48 == 0 or i == 0:
-                            print(f"  Progress: {i + 1}/{num_hours} hours")
-
-                elif model_config["feature_set"] == "full":  # ML Models
-                    history_slice = HISTORICAL_DATA_HOURLY.tail(168)
-                    X_future = generate_full_features(history_slice, future_dates_hourly)
-
-                    if hasattr(model, 'feature_names_in_'):
-                        expected_cols = model.feature_names_in_
-                        missing_in_future = set(expected_cols) - set(X_future.columns)
-                        if missing_in_future:
-                            raise ValueError(f"Feature generation missed expected columns: {missing_in_future}")
-                        extra_in_future = set(X_future.columns) - set(expected_cols)
-                        if extra_in_future:
-                            X_future = X_future.drop(columns=list(extra_in_future))
-                        X_future = X_future[expected_cols]
-
-                    if X_future.isnull().values.any():
-                        print(f"Warning: NaNs detected in features for {model_id}. Filling with 0.")
-                        X_future = X_future.fillna(0)
-                        if X_future.isnull().values.any():
-                            raise ValueError(f"NaNs persist after fillna for {model_id}")
-
-                    hourly_predictions = model.predict(X_future)
-
-                # --- Агрегація годинних до денних ---
-                if len(hourly_predictions) > 0:
-                    hourly_preds_series = pd.Series(hourly_predictions, index=future_dates_hourly)
-                    daily_preds = hourly_preds_series.resample('D').sum()
-                    final_preds = daily_preds.values
-                    final_dates = daily_preds.index
-                else:
-                    final_preds = []
-                    final_dates = pd.date_range(start=last_known_date_daily + pd.Timedelta(days=1),
-                                                periods=request.forecast_horizon, freq='D')
-
-            forecast_values = {str(date.date()): float(pred) for date, pred in zip(final_dates, final_preds)}
-
-        except Exception as pred_err:
-            error_message = f"Помилка прогнозування для моделі {model_id}: {pred_err}"
-            print(error_message)
-            forecast_values = {}
-            metadata["error"] = error_message
-
-        end_time = time.time()
-        metadata["latency_ms"] = round((end_time - start_time) * 1000, 2)
-
-        response_item = {
-            "model_id": model_id,
-            "forecast": forecast_values,
-            "metadata": metadata
+    # Execute predictions in parallel using ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all prediction tasks
+        future_to_model = {
+            executor.submit(
+                _predict_single_model,
+                model_id,
+                request.forecast_horizon,
+                last_known_date_hourly,
+                last_known_date_daily
+            ): model_id
+            for model_id in request.model_ids
         }
-        results.append(response_item)
+
+        # Collect results as they complete
+        for future in as_completed(future_to_model):
+            model_id = future_to_model[future]
+            try:
+                result = future.result()
+                results.append(result)
+                logger.info(f"Completed prediction for {model_id} - Latency: {result['metadata'].get('latency_ms', 'N/A')}ms")
+            except Exception as exc:
+                logger.error(f"Model {model_id} generated an exception during parallel execution: {exc}")
+                results.append({
+                    "model_id": model_id,
+                    "forecast": {},
+                    "metadata": {"error": f"Parallel execution error: {exc}"}
+                })
 
     return results
 
