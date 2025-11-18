@@ -4,7 +4,7 @@ import joblib
 import json
 import time
 import tensorflow as tf
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from prophet.serialize import model_from_json
 from fastapi import HTTPException
 import sklearn.ensemble
@@ -12,6 +12,7 @@ import functools
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
+from datetime import datetime, timedelta
 
 from .config import AVAILABLE_MODELS, BASE_DIR
 from .schemas import PredictionRequest, SimulationRequest
@@ -19,6 +20,10 @@ from .features import generate_simple_features, generate_full_features, create_s
 from .evaluation import evaluate_model
 
 logger = logging.getLogger(__name__)
+
+# Response cache with TTL (Time To Live)
+_response_cache: Dict[Tuple, Tuple[List[Dict[str, Any]], datetime]] = {}
+CACHE_TTL_SECONDS = 300  # 5 minutes cache
 
 MODELS_CACHE: Dict[str, Any] = {}
 HISTORICAL_DATA_HOURLY = None
@@ -269,12 +274,34 @@ def predict_service(request: PredictionRequest) -> List[Dict[str, Any]]:
     Виконує прогнозування для списку моделей, враховуючи їхні вимоги.
 
     Uses parallel execution with ThreadPoolExecutor for faster predictions.
+    Includes response caching with TTL for identical requests.
     """
     if not MODELS_CACHE or HISTORICAL_DATA_HOURLY is None or HISTORICAL_DATA_DAILY is None:
         raise HTTPException(status_code=503, detail="Сервіс недоступний: Моделі або історичні дані не завантажено.")
 
     last_known_date_hourly = HISTORICAL_DATA_HOURLY.index.max()
     last_known_date_daily = HISTORICAL_DATA_DAILY.index.max()
+
+    # Create cache key from request parameters and current date
+    cache_key = (
+        tuple(sorted(request.model_ids)),
+        request.forecast_horizon,
+        str(last_known_date_daily.date())
+    )
+
+    # Check cache
+    current_time = datetime.now()
+    if cache_key in _response_cache:
+        cached_result, cache_time = _response_cache[cache_key]
+        age_seconds = (current_time - cache_time).total_seconds()
+
+        if age_seconds < CACHE_TTL_SECONDS:
+            logger.info(f"⚡ Cache HIT! Returning cached result (age: {age_seconds:.1f}s)")
+            return cached_result
+        else:
+            # Cache expired, remove it
+            logger.info(f"Cache expired (age: {age_seconds:.1f}s), recalculating...")
+            del _response_cache[cache_key]
 
     # Determine optimal number of workers based on CPU cores
     # Use min(cpu_count, num_models) to avoid creating unnecessary threads
@@ -312,6 +339,17 @@ def predict_service(request: PredictionRequest) -> List[Dict[str, Any]]:
                     "forecast": {},
                     "metadata": {"error": f"Parallel execution error: {exc}"}
                 })
+
+    # Store result in cache
+    _response_cache[cache_key] = (results, current_time)
+    logger.info(f"💾 Stored result in cache (key: {len(_response_cache)} entries)")
+
+    # Cleanup old cache entries (keep max 100 entries)
+    if len(_response_cache) > 100:
+        oldest_keys = sorted(_response_cache.keys(), key=lambda k: _response_cache[k][1])[:50]
+        for old_key in oldest_keys:
+            del _response_cache[old_key]
+        logger.info(f"🧹 Cleaned up cache, removed {len(oldest_keys)} old entries")
 
     return results
 

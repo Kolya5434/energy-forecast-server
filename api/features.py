@@ -2,17 +2,35 @@ import pandas as pd
 import numpy as np
 import joblib
 from pathlib import Path
+import functools
+import hashlib
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
-def generate_simple_features(dates: pd.DatetimeIndex) -> pd.DataFrame:
-    """Generates a DataFrame with simple time-based features for daily data."""
+def _hash_dates(dates: pd.DatetimeIndex) -> str:
+    """Create a hash from DatetimeIndex for caching."""
+    return hashlib.md5(str(dates.tolist()).encode()).hexdigest()
+
+
+@functools.lru_cache(maxsize=64)
+def _generate_simple_features_cached(dates_hash: str, start: str, end: str, freq: str) -> pd.DataFrame:
+    """Cached version of simple feature generation."""
+    dates = pd.date_range(start=start, end=end, freq=freq)
     X_future = pd.DataFrame(index=dates)
     X_future['day_of_week'] = X_future.index.dayofweek
     X_future['month'] = X_future.index.month
     X_future['day_of_year'] = X_future.index.dayofyear
     return X_future
+
+
+def generate_simple_features(dates: pd.DatetimeIndex) -> pd.DataFrame:
+    """Generates a DataFrame with simple time-based features for daily data (with caching)."""
+    dates_hash = _hash_dates(dates)
+    start = str(dates[0])
+    end = str(dates[-1])
+    freq = dates.freq.freqstr if dates.freq else 'D'
+    return _generate_simple_features_cached(dates_hash, start, end, freq)
 
 
 def generate_full_features(history_df: pd.DataFrame, future_dates: pd.DatetimeIndex) -> pd.DataFrame:
