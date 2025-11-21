@@ -15,11 +15,175 @@ import logging
 from datetime import datetime, timedelta
 
 from .config import AVAILABLE_MODELS, BASE_DIR
-from .schemas import PredictionRequest, SimulationRequest
+from .schemas import (
+    PredictionRequest, SimulationRequest, WeatherConditions,
+    CalendarConditions, TimeScenario, EnergyConditions, ZoneConsumption
+)
 from .features import generate_simple_features, generate_full_features, create_sequences_for_dl
 from .evaluation import evaluate_model
 
+
 logger = logging.getLogger(__name__)
+
+
+def _apply_weather_conditions(X_future: pd.DataFrame, weather: WeatherConditions) -> pd.DataFrame:
+    """
+    Застосовує погодні умови до DataFrame з ознаками.
+    Повертає оновлений DataFrame.
+    """
+    weather_mapping = {
+        'temperature': weather.temperature,
+        'humidity': weather.humidity,
+        'wind_speed': weather.wind_speed,
+    }
+
+    applied_features = []
+    for feature_name, value in weather_mapping.items():
+        if value is not None and feature_name in X_future.columns:
+            X_future[feature_name] = value
+            applied_features.append(f"{feature_name}={value}")
+
+    if applied_features:
+        logger.info(f"Applied weather conditions: {', '.join(applied_features)}")
+
+    return X_future
+
+
+def _apply_calendar_conditions(X_future: pd.DataFrame, calendar: CalendarConditions) -> pd.DataFrame:
+    """
+    Застосовує календарні умови до DataFrame з ознаками.
+    Повертає оновлений DataFrame.
+    """
+    calendar_mapping = {
+        'is_holiday': 1 if calendar.is_holiday else 0 if calendar.is_holiday is not None else None,
+        'is_weekend': 1 if calendar.is_weekend else 0 if calendar.is_weekend is not None else None,
+    }
+
+    applied_features = []
+    for feature_name, value in calendar_mapping.items():
+        if value is not None and feature_name in X_future.columns:
+            X_future[feature_name] = value
+            applied_features.append(f"{feature_name}={value}")
+
+    if applied_features:
+        logger.info(f"Applied calendar conditions: {', '.join(applied_features)}")
+
+    return X_future
+
+
+def _apply_time_scenario(X_future: pd.DataFrame, time_scenario: TimeScenario) -> pd.DataFrame:
+    """
+    Застосовує часові сценарії до DataFrame з ознаками.
+    Дозволяє моделювати пікові години та сезонність.
+    """
+    time_mapping = {
+        'hour': time_scenario.hour,
+        'day_of_week': time_scenario.day_of_week,
+        'day_of_month': time_scenario.day_of_month,
+        'day_of_year': time_scenario.day_of_year,
+        'week_of_year': time_scenario.week_of_year,
+        'month': time_scenario.month,
+        'year': time_scenario.year,
+        'quarter': time_scenario.quarter,
+    }
+
+    applied_features = []
+    for feature_name, value in time_mapping.items():
+        if value is not None and feature_name in X_future.columns:
+            X_future[feature_name] = value
+            applied_features.append(f"{feature_name}={value}")
+
+    if applied_features:
+        logger.info(f"Applied time scenario: {', '.join(applied_features)}")
+
+    return X_future
+
+
+def _apply_zone_consumption(X_future: pd.DataFrame, zone: ZoneConsumption) -> pd.DataFrame:
+    """
+    Застосовує зонове споживання до DataFrame з ознаками.
+    Дозволяє моделювати сценарії по категоріях приладів.
+    """
+    zone_mapping = {
+        'Sub_metering_1': zone.sub_metering_1,
+        'Sub_metering_2': zone.sub_metering_2,
+        'Sub_metering_3': zone.sub_metering_3,
+    }
+
+    applied_features = []
+    for feature_name, value in zone_mapping.items():
+        if value is not None and feature_name in X_future.columns:
+            X_future[feature_name] = value
+            applied_features.append(f"{feature_name}={value}")
+
+    if applied_features:
+        logger.info(f"Applied zone consumption: {', '.join(applied_features)}")
+
+    return X_future
+
+
+def _apply_anomaly_flag(X_future: pd.DataFrame, is_anomaly: bool) -> pd.DataFrame:
+    """
+    Застосовує прапорець аномалії до DataFrame з ознаками.
+    """
+    if 'is_anomaly' in X_future.columns:
+        X_future['is_anomaly'] = 1 if is_anomaly else 0
+        logger.info(f"Applied anomaly flag: is_anomaly={1 if is_anomaly else 0}")
+
+    return X_future
+
+
+def _apply_energy_conditions(X_future: pd.DataFrame, energy: EnergyConditions) -> pd.DataFrame:
+    """
+    Застосовує енергетичні параметри мережі до DataFrame з ознаками.
+    Дозволяє моделювати what-if сценарії для напруги та струму.
+    """
+    energy_mapping = {
+        'Voltage': energy.voltage,
+        'Global_reactive_power': energy.global_reactive_power,
+        'Global_intensity': energy.global_intensity,
+    }
+
+    applied_features = []
+    for feature_name, value in energy_mapping.items():
+        if value is not None and feature_name in X_future.columns:
+            X_future[feature_name] = value
+            applied_features.append(f"{feature_name}={value}")
+
+    if applied_features:
+        logger.info(f"Applied energy conditions: {', '.join(applied_features)}")
+
+    return X_future
+
+
+def _apply_all_conditions(X_future: pd.DataFrame, request) -> pd.DataFrame:
+    """
+    Застосовує всі умови з request до DataFrame з ознаками.
+    Використовується як в predict_service, так і в simulate_service.
+    """
+    if request is None:
+        return X_future
+
+    if hasattr(request, 'weather') and request.weather:
+        X_future = _apply_weather_conditions(X_future, request.weather)
+
+    if hasattr(request, 'calendar') and request.calendar:
+        X_future = _apply_calendar_conditions(X_future, request.calendar)
+
+    if hasattr(request, 'time_scenario') and request.time_scenario:
+        X_future = _apply_time_scenario(X_future, request.time_scenario)
+
+    if hasattr(request, 'energy') and request.energy:
+        X_future = _apply_energy_conditions(X_future, request.energy)
+
+    if hasattr(request, 'zone_consumption') and request.zone_consumption:
+        X_future = _apply_zone_consumption(X_future, request.zone_consumption)
+
+    if hasattr(request, 'is_anomaly') and request.is_anomaly is not None:
+        X_future = _apply_anomaly_flag(X_future, request.is_anomaly)
+
+    return X_future
+
 
 # Response cache with TTL (Time To Live)
 _response_cache: Dict[Tuple, Tuple[List[Dict[str, Any]], datetime]] = {}
@@ -108,11 +272,13 @@ def _predict_single_model(
     model_id: str,
     forecast_horizon: int,
     last_known_date_hourly: pd.Timestamp,
-    last_known_date_daily: pd.Timestamp
+    last_known_date_daily: pd.Timestamp,
+    request: PredictionRequest = None
 ) -> Dict[str, Any]:
     """
     Executes prediction for a single model.
     This function is extracted for parallel execution via ThreadPoolExecutor.
+    Supports optional condition parameters from request.
     """
     if model_id not in MODELS_CACHE:
         logger.warning(f"Model {model_id} requested but not loaded/available. Skipping.")
@@ -139,6 +305,8 @@ def _predict_single_model(
 
             if model_config["feature_set"] == "simple":
                 X_future = generate_simple_features(future_dates)
+                # Застосування умов з request
+                X_future = _apply_all_conditions(X_future, request)
                 if hasattr(model, 'feature_names_in_'):
                     X_future = X_future[model.feature_names_in_]
                 if X_future.isnull().values.any():
@@ -220,6 +388,8 @@ def _predict_single_model(
             elif model_config["feature_set"] == "full":  # ML Models
                 history_slice = HISTORICAL_DATA_HOURLY.tail(168)
                 X_future = generate_full_features(history_slice, future_dates_hourly)
+                # Застосування умов з request
+                X_future = _apply_all_conditions(X_future, request)
 
                 if hasattr(model, 'feature_names_in_'):
                     expected_cols = model.feature_names_in_
@@ -283,10 +453,20 @@ def predict_service(request: PredictionRequest) -> List[Dict[str, Any]]:
     last_known_date_daily = HISTORICAL_DATA_DAILY.index.max()
 
     # Create cache key from request parameters and current date
+    # Include conditions in cache key to differentiate requests with different parameters
+    conditions_key = (
+        str(request.weather.model_dump() if request.weather else None),
+        str(request.calendar.model_dump() if request.calendar else None),
+        str(request.time_scenario.model_dump() if request.time_scenario else None),
+        str(request.energy.model_dump() if request.energy else None),
+        str(request.zone_consumption.model_dump() if request.zone_consumption else None),
+        request.is_anomaly
+    )
     cache_key = (
         tuple(sorted(request.model_ids)),
         request.forecast_horizon,
-        str(last_known_date_daily.date())
+        str(last_known_date_daily.date()),
+        conditions_key
     )
 
     # Check cache
@@ -320,7 +500,8 @@ def predict_service(request: PredictionRequest) -> List[Dict[str, Any]]:
                 model_id,
                 request.forecast_horizon,
                 last_known_date_hourly,
-                last_known_date_daily
+                last_known_date_daily,
+                request  # Pass request for condition parameters
             ): model_id
             for model_id in request.model_ids
         }
@@ -585,14 +766,39 @@ def simulate_service(request: SimulationRequest) -> Dict[str, Any]:
     if X_future is None:
         raise NotImplementedError(f"Генерація ознак для симуляції моделі '{model_id}' не реалізована.")
 
-    print(f"Applying {len(overrides)} feature overrides...")
+    # Застосування погодних умов (якщо передані)
+    if request.weather:
+        X_future = _apply_weather_conditions(X_future, request.weather)
+
+    # Застосування календарних умов (якщо передані)
+    if request.calendar:
+        X_future = _apply_calendar_conditions(X_future, request.calendar)
+
+    # Застосування часових сценаріїв (якщо передані)
+    if request.time_scenario:
+        X_future = _apply_time_scenario(X_future, request.time_scenario)
+
+    # Застосування енергетичних параметрів (якщо передані)
+    if request.energy:
+        X_future = _apply_energy_conditions(X_future, request.energy)
+
+    # Застосування зонового споживання (якщо передане)
+    if request.zone_consumption:
+        X_future = _apply_zone_consumption(X_future, request.zone_consumption)
+
+    # Застосування прапорця аномалії (якщо передано)
+    if request.is_anomaly is not None:
+        X_future = _apply_anomaly_flag(X_future, request.is_anomaly)
+
+    # Застосування індивідуальних змін (feature_overrides)
+    logger.info(f"Applying {len(overrides)} feature overrides...")
     for override in overrides:
         try:
             date_to_change = pd.to_datetime(override.date)
             target_rows = X_future.index.date == date_to_change.date()
 
             if not np.any(target_rows):
-                print(f"Warning: Дата {override.date} не знайдена в горизонті прогнозу. Зміна проігнорована.")
+                logger.warning(f"Дата {override.date} не знайдена в горизонті прогнозу. Зміна проігнорована.")
                 continue
 
             for feature, value in override.features.items():
