@@ -17,7 +17,8 @@ from datetime import datetime, timedelta
 from .config import AVAILABLE_MODELS, BASE_DIR
 from .schemas import (
     PredictionRequest, SimulationRequest, WeatherConditions,
-    CalendarConditions, TimeScenario, EnergyConditions, ZoneConsumption
+    CalendarConditions, TimeScenario, EnergyConditions, ZoneConsumption,
+    LagOverrides, VolatilityScenario, CompareRequest, ScenarioResult, CompareResponse
 )
 from .features import generate_simple_features, generate_full_features, create_sequences_for_dl
 from .evaluation import evaluate_model
@@ -156,6 +157,58 @@ def _apply_energy_conditions(X_future: pd.DataFrame, energy: EnergyConditions) -
     return X_future
 
 
+def _apply_lag_overrides(X_future: pd.DataFrame, lag_overrides: LagOverrides) -> pd.DataFrame:
+    """
+    Застосовує перевизначення лагових ознак до DataFrame.
+    Дозволяє моделювати сценарії 'якщо вчора було X споживання'.
+    """
+    lag_mapping = {
+        'Global_active_power_lag_1': lag_overrides.lag_1,
+        'Global_active_power_lag_2': lag_overrides.lag_2,
+        'Global_active_power_lag_3': lag_overrides.lag_3,
+        'Global_active_power_lag_24': lag_overrides.lag_24,
+        'Global_active_power_lag_48': lag_overrides.lag_48,
+        'Global_active_power_lag_168': lag_overrides.lag_168,
+    }
+
+    applied_features = []
+    for feature_name, value in lag_mapping.items():
+        if value is not None and feature_name in X_future.columns:
+            X_future[feature_name] = value
+            applied_features.append(f"{feature_name}={value}")
+
+    if applied_features:
+        logger.info(f"Applied lag overrides: {', '.join(applied_features)}")
+
+    return X_future
+
+
+def _apply_volatility_scenario(X_future: pd.DataFrame, volatility: VolatilityScenario) -> pd.DataFrame:
+    """
+    Застосовує сценарії волатильності до DataFrame.
+    Дозволяє моделювати стабільне або нестабільне споживання.
+    """
+    volatility_mapping = {
+        'Global_active_power_roll_mean_3': volatility.roll_mean_3,
+        'Global_active_power_roll_std_3': volatility.roll_std_3,
+        'Global_active_power_roll_mean_24': volatility.roll_mean_24,
+        'Global_active_power_roll_std_24': volatility.roll_std_24,
+        'Global_active_power_roll_mean_168': volatility.roll_mean_168,
+        'Global_active_power_roll_std_168': volatility.roll_std_168,
+    }
+
+    applied_features = []
+    for feature_name, value in volatility_mapping.items():
+        if value is not None and feature_name in X_future.columns:
+            X_future[feature_name] = value
+            applied_features.append(f"{feature_name}={value}")
+
+    if applied_features:
+        logger.info(f"Applied volatility scenario: {', '.join(applied_features)}")
+
+    return X_future
+
+
 def _apply_all_conditions(X_future: pd.DataFrame, request) -> pd.DataFrame:
     """
     Застосовує всі умови з request до DataFrame з ознаками.
@@ -178,6 +231,12 @@ def _apply_all_conditions(X_future: pd.DataFrame, request) -> pd.DataFrame:
 
     if hasattr(request, 'zone_consumption') and request.zone_consumption:
         X_future = _apply_zone_consumption(X_future, request.zone_consumption)
+
+    if hasattr(request, 'lag_overrides') and request.lag_overrides:
+        X_future = _apply_lag_overrides(X_future, request.lag_overrides)
+
+    if hasattr(request, 'volatility') and request.volatility:
+        X_future = _apply_volatility_scenario(X_future, request.volatility)
 
     if hasattr(request, 'is_anomaly') and request.is_anomaly is not None:
         X_future = _apply_anomaly_flag(X_future, request.is_anomaly)
@@ -928,13 +987,28 @@ def get_historical_service(
     }
 
     if include_stats:
-        result["statistics"] = {
-            "min": float(data.min()),
-            "max": float(data.max()),
-            "mean": float(data.mean()),
-            "std": float(data.std()),
-            "median": float(data.median())
-        }
+        # Фільтруємо нульові значення (зазвичай це відсутні/невалідні дані)
+        valid_data = data[data > 0]
+        if len(valid_data) > 0:
+            result["statistics"] = {
+                "min": float(valid_data.min()),
+                "max": float(valid_data.max()),
+                "mean": float(valid_data.mean()),
+                "std": float(valid_data.std()),
+                "median": float(valid_data.median()),
+                "valid_points": len(valid_data),
+                "zero_points": len(data) - len(valid_data)
+            }
+        else:
+            result["statistics"] = {
+                "min": 0.0,
+                "max": 0.0,
+                "mean": 0.0,
+                "std": 0.0,
+                "median": 0.0,
+                "valid_points": 0,
+                "zero_points": len(data)
+            }
 
     return result
 
@@ -996,3 +1070,389 @@ def get_features_service(model_id: str) -> Dict[str, Any]:
         feature_info["note"] = "Модель не завантажена або не має інформації про ознаки."
 
     return feature_info
+
+
+# ============== NEW ANALYTICS SERVICES ==============
+
+def get_patterns_service(period: str = "daily") -> Dict[str, Any]:
+    """
+    Повертає сезонні патерни споживання енергії.
+
+    Args:
+        period: 'hourly', 'daily', 'weekly', 'monthly', 'yearly'
+    """
+    if HISTORICAL_DATA_HOURLY is None:
+        raise HTTPException(status_code=503, detail="Історичні дані не завантажено.")
+
+    data = HISTORICAL_DATA_HOURLY['Global_active_power']
+    result = {"period": period}
+
+    if period == "hourly":
+        # Патерн по годинах доби
+        hourly_pattern = data.groupby(data.index.hour).agg(['mean', 'std', 'min', 'max'])
+        result["pattern"] = {
+            str(hour): {
+                "mean": float(row['mean']),
+                "std": float(row['std']),
+                "min": float(row['min']),
+                "max": float(row['max'])
+            }
+            for hour, row in hourly_pattern.iterrows()
+        }
+        # Пікові години
+        peak_hour = int(hourly_pattern['mean'].idxmax())
+        off_peak_hour = int(hourly_pattern['mean'].idxmin())
+        result["peak_hour"] = peak_hour
+        result["off_peak_hour"] = off_peak_hour
+        result["peak_to_offpeak_ratio"] = float(hourly_pattern['mean'].max() / hourly_pattern['mean'].min())
+
+    elif period == "daily":
+        # Патерн по днях тижня
+        daily_pattern = data.groupby(data.index.dayofweek).agg(['mean', 'std', 'min', 'max'])
+        day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+        result["pattern"] = {
+            day_names[day]: {
+                "mean": float(row['mean']),
+                "std": float(row['std']),
+                "min": float(row['min']),
+                "max": float(row['max'])
+            }
+            for day, row in daily_pattern.iterrows()
+        }
+        result["weekday_avg"] = float(daily_pattern.loc[:4, 'mean'].mean())
+        result["weekend_avg"] = float(daily_pattern.loc[5:, 'mean'].mean())
+        result["weekend_effect"] = float((result["weekend_avg"] - result["weekday_avg"]) / result["weekday_avg"] * 100)
+
+    elif period == "weekly":
+        # Патерн по тижнях року
+        weekly_data = data.resample('W').sum()
+        weekly_pattern = weekly_data.groupby(weekly_data.index.isocalendar().week).agg(['mean', 'std'])
+        result["pattern"] = {
+            str(week): {"mean": float(row['mean']), "std": float(row['std'])}
+            for week, row in weekly_pattern.iterrows()
+        }
+
+    elif period == "monthly":
+        # Патерн по місяцях
+        monthly_pattern = data.groupby(data.index.month).agg(['mean', 'std', 'min', 'max'])
+        month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+        result["pattern"] = {
+            month_names[month-1]: {
+                "mean": float(row['mean']),
+                "std": float(row['std']),
+                "min": float(row['min']),
+                "max": float(row['max'])
+            }
+            for month, row in monthly_pattern.iterrows()
+        }
+        # Сезонність
+        result["winter_avg"] = float(monthly_pattern.loc[[12, 1, 2], 'mean'].mean())
+        result["summer_avg"] = float(monthly_pattern.loc[[6, 7, 8], 'mean'].mean())
+        result["seasonal_variation"] = float((result["winter_avg"] - result["summer_avg"]) / result["summer_avg"] * 100)
+
+    elif period == "yearly":
+        # Патерн по роках
+        yearly_data = data.resample('Y').sum()
+        result["pattern"] = {
+            str(date.year): float(val)
+            for date, val in yearly_data.items()
+        }
+        result["trend"] = "increasing" if yearly_data.iloc[-1] > yearly_data.iloc[0] else "decreasing"
+        result["total_change_percent"] = float((yearly_data.iloc[-1] - yearly_data.iloc[0]) / yearly_data.iloc[0] * 100)
+
+    return result
+
+
+def get_anomalies_service(
+    threshold: float = 2.0,
+    days: int = 30,
+    include_details: bool = True
+) -> Dict[str, Any]:
+    """
+    Повертає історію аномалій споживання.
+
+    Args:
+        threshold: Поріг стандартних відхилень для визначення аномалії
+        days: Кількість днів для аналізу
+        include_details: Чи включати деталі кожної аномалії
+    """
+    if HISTORICAL_DATA_HOURLY is None:
+        raise HTTPException(status_code=503, detail="Історичні дані не завантажено.")
+
+    data = HISTORICAL_DATA_HOURLY.tail(days * 24).copy()
+    power = data['Global_active_power']
+
+    # Обчислюємо z-score
+    mean_val = power.mean()
+    std_val = power.std()
+    z_scores = (power - mean_val) / std_val
+
+    # Знаходимо аномалії
+    anomaly_mask = abs(z_scores) > threshold
+    anomalies = data[anomaly_mask]
+
+    result = {
+        "threshold": threshold,
+        "period_days": days,
+        "total_points": len(data),
+        "anomaly_count": len(anomalies),
+        "anomaly_percentage": float(len(anomalies) / len(data) * 100),
+        "statistics": {
+            "mean": float(mean_val),
+            "std": float(std_val),
+            "threshold_upper": float(mean_val + threshold * std_val),
+            "threshold_lower": float(mean_val - threshold * std_val)
+        }
+    }
+
+    if include_details and len(anomalies) > 0:
+        # Групуємо аномалії
+        high_anomalies = anomalies[z_scores[anomaly_mask] > 0]
+        low_anomalies = anomalies[z_scores[anomaly_mask] < 0]
+
+        result["high_anomalies"] = {
+            "count": len(high_anomalies),
+            "dates": [str(idx) for idx in high_anomalies.index[:20]],  # Top 20
+            "max_value": float(high_anomalies['Global_active_power'].max()) if len(high_anomalies) > 0 else None
+        }
+        result["low_anomalies"] = {
+            "count": len(low_anomalies),
+            "dates": [str(idx) for idx in low_anomalies.index[:20]],
+            "min_value": float(low_anomalies['Global_active_power'].min()) if len(low_anomalies) > 0 else None
+        }
+
+        # Аномалії по днях тижня
+        anomaly_by_day = anomalies.groupby(anomalies.index.dayofweek).size()
+        day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+        result["anomalies_by_day"] = {day_names[i]: int(anomaly_by_day.get(i, 0)) for i in range(7)}
+
+        # Аномалії по годинах
+        anomaly_by_hour = anomalies.groupby(anomalies.index.hour).size()
+        result["anomalies_by_hour"] = {str(h): int(anomaly_by_hour.get(h, 0)) for h in range(24)}
+
+    # Використовуємо колонку is_anomaly якщо є
+    if 'is_anomaly' in data.columns:
+        flagged_anomalies = data[data['is_anomaly'] == 1]
+        result["flagged_anomalies"] = {
+            "count": len(flagged_anomalies),
+            "percentage": float(len(flagged_anomalies) / len(data) * 100)
+        }
+
+    return result
+
+
+def get_peaks_service(
+    top_n: int = 10,
+    granularity: str = "hourly"
+) -> Dict[str, Any]:
+    """
+    Повертає пікові періоди споживання.
+
+    Args:
+        top_n: Кількість топ піків для повернення
+        granularity: 'hourly' або 'daily'
+    """
+    if HISTORICAL_DATA_HOURLY is None or HISTORICAL_DATA_DAILY is None:
+        raise HTTPException(status_code=503, detail="Історичні дані не завантажено.")
+
+    if granularity == "hourly":
+        data = HISTORICAL_DATA_HOURLY['Global_active_power']
+        freq_label = "hours"
+    else:
+        data = HISTORICAL_DATA_DAILY['Global_active_power']
+        freq_label = "days"
+
+    # Топ максимуми
+    top_peaks = data.nlargest(top_n)
+    # Топ мінімуми
+    top_lows = data.nsmallest(top_n)
+
+    result = {
+        "granularity": granularity,
+        "total_points": len(data),
+        "peak_consumption": {
+            "top_peaks": [
+                {"date": str(idx), "value": float(val)}
+                for idx, val in top_peaks.items()
+            ],
+            "average_peak": float(top_peaks.mean()),
+            "max_value": float(top_peaks.max()),
+            "max_date": str(top_peaks.idxmax())
+        },
+        "low_consumption": {
+            "top_lows": [
+                {"date": str(idx), "value": float(val)}
+                for idx, val in top_lows.items()
+            ],
+            "average_low": float(top_lows.mean()),
+            "min_value": float(top_lows.min()),
+            "min_date": str(top_lows.idxmin())
+        },
+        "statistics": {
+            "mean": float(data.mean()),
+            "median": float(data.median()),
+            "std": float(data.std()),
+            "percentile_95": float(data.quantile(0.95)),
+            "percentile_5": float(data.quantile(0.05))
+        }
+    }
+
+    # Аналіз пікових годин (для hourly)
+    if granularity == "hourly":
+        hourly_avg = data.groupby(data.index.hour).mean()
+        result["peak_hours"] = {
+            "morning_peak": int(hourly_avg.loc[6:11].idxmax()),
+            "evening_peak": int(hourly_avg.loc[17:22].idxmax()),
+            "off_peak": int(hourly_avg.idxmin())
+        }
+        result["hourly_averages"] = {str(h): float(v) for h, v in hourly_avg.items()}
+
+    return result
+
+
+def get_decomposition_service(period: int = 24) -> Dict[str, Any]:
+    """
+    Повертає сезонну декомпозицію часового ряду.
+
+    Args:
+        period: Період сезонності (24 для добової, 168 для тижневої)
+    """
+    if HISTORICAL_DATA_HOURLY is None:
+        raise HTTPException(status_code=503, detail="Історичні дані не завантажено.")
+
+    try:
+        from statsmodels.tsa.seasonal import seasonal_decompose
+    except ImportError:
+        raise HTTPException(status_code=500, detail="Бібліотека statsmodels не встановлена.")
+
+    # Беремо останні дані для декомпозиції
+    data = HISTORICAL_DATA_HOURLY['Global_active_power'].tail(period * 14)  # 14 періодів
+
+    # Виконуємо декомпозицію
+    decomposition = seasonal_decompose(data, model='additive', period=period)
+
+    # Готуємо результат (семплюємо для зменшення розміру)
+    sample_size = min(len(data), 168)  # Максимум тиждень
+    step = max(1, len(data) // sample_size)
+
+    result = {
+        "period": period,
+        "period_description": "daily" if period == 24 else "weekly" if period == 168 else f"{period} hours",
+        "data_points": len(data),
+        "components": {
+            "trend": {
+                str(idx): float(val) if not np.isnan(val) else None
+                for idx, val in decomposition.trend[::step].items()
+            },
+            "seasonal": {
+                str(idx): float(val) if not np.isnan(val) else None
+                for idx, val in decomposition.seasonal[::step].items()
+            },
+            "residual": {
+                str(idx): float(val) if not np.isnan(val) else None
+                for idx, val in decomposition.resid[::step].items()
+            }
+        },
+        "summary": {
+            "trend_strength": float(1 - decomposition.resid.var() / (decomposition.trend + decomposition.resid).var()) if decomposition.trend.var() > 0 else 0,
+            "seasonal_strength": float(1 - decomposition.resid.var() / (decomposition.seasonal + decomposition.resid).var()) if decomposition.seasonal.var() > 0 else 0,
+            "residual_std": float(decomposition.resid.std()),
+            "seasonal_amplitude": float(decomposition.seasonal.max() - decomposition.seasonal.min())
+        }
+    }
+
+    return result
+
+
+def compare_scenarios_service(request: CompareRequest) -> Dict[str, Any]:
+    """
+    Порівнює різні сценарії прогнозування.
+    """
+    model_id = request.model_id
+    horizon = request.forecast_horizon
+
+    if model_id not in MODELS_CACHE:
+        raise HTTPException(status_code=404, detail=f"Модель '{model_id}' не завантажена.")
+
+    model_config = AVAILABLE_MODELS[model_id]
+    if not model_config.get("supports_conditions", False):
+        raise HTTPException(status_code=400, detail=f"Модель '{model_id}' не підтримує умови для порівняння.")
+
+    start_time = time.time()
+
+    # Генеруємо baseline прогноз
+    from .schemas import PredictionRequest
+    baseline_request = PredictionRequest(
+        model_ids=[model_id],
+        forecast_horizon=horizon
+    )
+
+    last_known_date_hourly = HISTORICAL_DATA_HOURLY.index.max()
+    last_known_date_daily = HISTORICAL_DATA_DAILY.index.max()
+
+    baseline_result = _predict_single_model(
+        model_id, horizon, last_known_date_hourly, last_known_date_daily, baseline_request
+    )
+
+    baseline_forecast = baseline_result["forecast"]
+    baseline_total = sum(baseline_forecast.values())
+    baseline_avg = baseline_total / len(baseline_forecast) if baseline_forecast else 0
+
+    baseline_scenario = ScenarioResult(
+        name="baseline",
+        forecast=baseline_forecast,
+        total_consumption=baseline_total,
+        avg_daily=baseline_avg
+    )
+
+    # Обробляємо сценарії
+    scenario_results = []
+    for scenario in request.scenarios:
+        scenario_name = scenario.get("name", f"scenario_{len(scenario_results)}")
+
+        # Створюємо request з умовами сценарію
+        scenario_request = PredictionRequest(
+            model_ids=[model_id],
+            forecast_horizon=horizon,
+            weather=WeatherConditions(**scenario["weather"]) if "weather" in scenario else None,
+            calendar=CalendarConditions(**scenario["calendar"]) if "calendar" in scenario else None,
+            time_scenario=TimeScenario(**scenario["time_scenario"]) if "time_scenario" in scenario else None,
+            energy=EnergyConditions(**scenario["energy"]) if "energy" in scenario else None,
+            zone_consumption=ZoneConsumption(**scenario["zone_consumption"]) if "zone_consumption" in scenario else None,
+            lag_overrides=LagOverrides(**scenario["lag_overrides"]) if "lag_overrides" in scenario else None,
+            volatility=VolatilityScenario(**scenario["volatility"]) if "volatility" in scenario else None,
+            is_anomaly=scenario.get("is_anomaly")
+        )
+
+        scenario_result = _predict_single_model(
+            model_id, horizon, last_known_date_hourly, last_known_date_daily, scenario_request
+        )
+
+        scenario_forecast = scenario_result["forecast"]
+        scenario_total = sum(scenario_forecast.values())
+        scenario_avg = scenario_total / len(scenario_forecast) if scenario_forecast else 0
+
+        diff_from_baseline = scenario_total - baseline_total
+        diff_percent = (diff_from_baseline / baseline_total * 100) if baseline_total > 0 else 0
+
+        scenario_results.append(ScenarioResult(
+            name=scenario_name,
+            forecast=scenario_forecast,
+            total_consumption=scenario_total,
+            avg_daily=scenario_avg,
+            difference_from_baseline=diff_from_baseline,
+            difference_percent=diff_percent
+        ))
+
+    end_time = time.time()
+
+    return {
+        "model_id": model_id,
+        "baseline": baseline_scenario.model_dump(),
+        "scenarios": [s.model_dump() for s in scenario_results],
+        "metadata": {
+            "forecast_horizon": horizon,
+            "scenarios_count": len(scenario_results),
+            "latency_ms": round((end_time - start_time) * 1000, 2)
+        }
+    }

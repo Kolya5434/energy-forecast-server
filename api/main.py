@@ -2,7 +2,7 @@ from fastapi import HTTPException, Request
 from typing import List
 
 from .config import app
-from .schemas import PredictionRequest, PredictionResponse, SimulationRequest
+from .schemas import PredictionRequest, PredictionResponse, SimulationRequest, CompareRequest
 from . import services
 from starlette.concurrency import run_in_threadpool
 
@@ -139,6 +139,141 @@ async def get_features(model_id: str):
         raise
     except Exception as e:
         print(f"Помилка при отриманні ознак моделі: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============== NEW ANALYTICS ENDPOINTS ==============
+
+@app.get("/api/patterns", summary="Отримати сезонні патерни споживання")
+async def get_patterns(period: str = "daily"):
+    """
+    Повертає сезонні патерни споживання енергії.
+
+    - **period**: 'hourly', 'daily', 'weekly', 'monthly', 'yearly'
+    """
+    try:
+        valid_periods = ["hourly", "daily", "weekly", "monthly", "yearly"]
+        if period not in valid_periods:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Параметр 'period' має бути одним з: {', '.join(valid_periods)}"
+            )
+        result = await run_in_threadpool(services.get_patterns_service, period)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Помилка при отриманні патернів: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/anomalies", summary="Отримати історію аномалій споживання")
+async def get_anomalies(
+    threshold: float = 2.0,
+    days: int = 30,
+    include_details: bool = True
+):
+    """
+    Повертає аналіз аномалій споживання енергії.
+
+    - **threshold**: Поріг стандартних відхилень (1.5-3.0 рекомендовано)
+    - **days**: Кількість днів для аналізу (1-365)
+    - **include_details**: Чи включати деталізовану інформацію
+    """
+    try:
+        if threshold < 0.5 or threshold > 5.0:
+            raise HTTPException(status_code=400, detail="Параметр 'threshold' має бути від 0.5 до 5.0")
+        if days < 1 or days > 365:
+            raise HTTPException(status_code=400, detail="Параметр 'days' має бути від 1 до 365")
+
+        result = await run_in_threadpool(
+            services.get_anomalies_service,
+            threshold,
+            days,
+            include_details
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Помилка при отриманні аномалій: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/peaks", summary="Отримати пікові періоди споживання")
+async def get_peaks(
+    top_n: int = 10,
+    granularity: str = "hourly"
+):
+    """
+    Повертає топ пікових та мінімальних періодів споживання.
+
+    - **top_n**: Кількість топ записів (1-100)
+    - **granularity**: 'hourly' або 'daily'
+    """
+    try:
+        if top_n < 1 or top_n > 100:
+            raise HTTPException(status_code=400, detail="Параметр 'top_n' має бути від 1 до 100")
+        if granularity not in ["hourly", "daily"]:
+            raise HTTPException(status_code=400, detail="Параметр 'granularity' має бути 'hourly' або 'daily'")
+
+        result = await run_in_threadpool(services.get_peaks_service, top_n, granularity)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Помилка при отриманні піків: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/decomposition", summary="Отримати сезонну декомпозицію")
+async def get_decomposition(period: int = 24):
+    """
+    Повертає сезонну декомпозицію часового ряду (trend, seasonal, residual).
+
+    - **period**: Період сезонності в годинах (24=добова, 168=тижнева)
+    """
+    try:
+        valid_periods = [24, 168, 12, 48]
+        if period not in valid_periods:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Параметр 'period' має бути одним з: {', '.join(map(str, valid_periods))}"
+            )
+        result = await run_in_threadpool(services.get_decomposition_service, period)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Помилка при декомпозиції: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/compare", summary="Порівняти сценарії прогнозування")
+async def compare_scenarios(request: CompareRequest):
+    """
+    Порівнює baseline прогноз з кількома сценаріями.
+
+    Приклад запиту:
+    ```json
+    {
+        "model_id": "XGBoost_Tuned",
+        "forecast_horizon": 7,
+        "scenarios": [
+            {"name": "cold_weather", "weather": {"temperature": -5}},
+            {"name": "hot_weather", "weather": {"temperature": 35}},
+            {"name": "holiday", "calendar": {"is_holiday": true}}
+        ]
+    }
+    ```
+    """
+    try:
+        result = await run_in_threadpool(services.compare_scenarios_service, request)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Помилка при порівнянні сценаріїв: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
