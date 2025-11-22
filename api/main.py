@@ -90,6 +90,58 @@ async def simulate_prediction(request: SimulationRequest):
         print(f"Неочікувана помилка під час симуляції: {e}")
         raise HTTPException(status_code=500, detail="Внутрішня помилка сервера під час симуляції.")
 
+@app.get("/api/historical", summary="Отримати історичні дані споживання")
+async def get_historical(
+    days: int = 30,
+    granularity: str = "daily",
+    include_stats: bool = False
+):
+    """
+    Повертає історичні дані споживання енергії.
+
+    - **days**: Кількість днів історії (1-365)
+    - **granularity**: 'daily' або 'hourly'
+    - **include_stats**: Чи включати статистику (min, max, mean, std, median)
+    """
+    try:
+        if days < 1 or days > 365:
+            raise HTTPException(status_code=400, detail="Параметр 'days' має бути від 1 до 365.")
+        if granularity not in ["daily", "hourly"]:
+            raise HTTPException(status_code=400, detail="Параметр 'granularity' має бути 'daily' або 'hourly'.")
+
+        result = await run_in_threadpool(
+            services.get_historical_service,
+            days,
+            granularity,
+            include_stats
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Помилка при отриманні історичних даних: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/features/{model_id}", summary="Отримати інформацію про ознаки моделі")
+async def get_features(model_id: str):
+    """
+    Повертає детальну інформацію про ознаки, які використовує модель.
+
+    - Список всіх ознак моделі
+    - Категорії доступних умов (weather, calendar, time, energy, zone_consumption)
+    - Чи підтримує модель умови для прогнозування
+    """
+    try:
+        result = await run_in_threadpool(services.get_features_service, model_id)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Помилка при отриманні ознак моделі: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/")
 def root():
     """Root endpoint - швидкий відгук без моделей"""

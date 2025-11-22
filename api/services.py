@@ -260,12 +260,25 @@ def initialize_services():
 
 
 def get_models_service() -> Dict[str, Any]:
-    """Повертає інформацію про доступні (завантажені) моделі."""
+    """Повертає розширену інформацію про доступні (завантажені) моделі."""
     loaded_model_ids = list(MODELS_CACHE.keys())
-    return {mid: {"type": AVAILABLE_MODELS[mid]["type"],
-                  "granularity": AVAILABLE_MODELS[mid]["granularity"],
-                  "feature_set": AVAILABLE_MODELS[mid]["feature_set"]}
-            for mid in loaded_model_ids if mid in AVAILABLE_MODELS}
+    result = {}
+    for mid in loaded_model_ids:
+        if mid not in AVAILABLE_MODELS:
+            continue
+        config = AVAILABLE_MODELS[mid]
+        static_metrics = STATIC_PERFORMANCE_METRICS.get(mid, {})
+        result[mid] = {
+            "type": config["type"],
+            "granularity": config["granularity"],
+            "feature_set": config["feature_set"],
+            "description": config.get("description", ""),
+            "supports_conditions": config.get("supports_conditions", False),
+            "supports_simulation": config.get("supports_simulation", False),
+            "avg_latency_ms": static_metrics.get("avg_latency_ms"),
+            "memory_increment_mb": static_metrics.get("memory_increment_mb"),
+        }
+    return result
 
 
 def _predict_single_model(
@@ -430,6 +443,24 @@ def _predict_single_model(
 
     end_time = time.time()
     metadata["latency_ms"] = round((end_time - start_time) * 1000, 2)
+
+    # Додаємо інформацію про застосовані умови
+    if request:
+        conditions_applied = {}
+        if request.weather:
+            conditions_applied["weather"] = request.weather.model_dump(exclude_none=True)
+        if request.calendar:
+            conditions_applied["calendar"] = request.calendar.model_dump(exclude_none=True)
+        if request.time_scenario:
+            conditions_applied["time_scenario"] = request.time_scenario.model_dump(exclude_none=True)
+        if request.energy:
+            conditions_applied["energy"] = request.energy.model_dump(exclude_none=True)
+        if request.zone_consumption:
+            conditions_applied["zone_consumption"] = request.zone_consumption.model_dump(exclude_none=True)
+        if request.is_anomaly is not None:
+            conditions_applied["is_anomaly"] = request.is_anomaly
+        if conditions_applied:
+            metadata["conditions_applied"] = conditions_applied
 
     response_item = {
         "model_id": model_id,
@@ -834,8 +865,134 @@ def simulate_service(request: SimulationRequest) -> Dict[str, Any]:
 
     metadata = {"latency_ms": round((end_time - start_time) * 1000, 2), "simulated": True}
 
+    # Додаємо інформацію про застосовані умови
+    conditions_applied = {}
+    if request.weather:
+        conditions_applied["weather"] = request.weather.model_dump(exclude_none=True)
+    if request.calendar:
+        conditions_applied["calendar"] = request.calendar.model_dump(exclude_none=True)
+    if request.time_scenario:
+        conditions_applied["time_scenario"] = request.time_scenario.model_dump(exclude_none=True)
+    if request.energy:
+        conditions_applied["energy"] = request.energy.model_dump(exclude_none=True)
+    if request.zone_consumption:
+        conditions_applied["zone_consumption"] = request.zone_consumption.model_dump(exclude_none=True)
+    if request.is_anomaly is not None:
+        conditions_applied["is_anomaly"] = request.is_anomaly
+    if overrides:
+        conditions_applied["feature_overrides"] = [
+            {"date": o.date, "features": o.features} for o in overrides
+        ]
+    if conditions_applied:
+        metadata["conditions_applied"] = conditions_applied
+
     return {
         "model_id": model_id,
         "forecast": forecast_values,
         "metadata": metadata
     }
+
+
+def get_historical_service(
+    days: int = 30,
+    granularity: str = "daily",
+    include_stats: bool = False
+) -> Dict[str, Any]:
+    """
+    Повертає історичні дані споживання енергії.
+
+    Args:
+        days: Кількість днів історії (за замовчуванням 30)
+        granularity: 'daily' або 'hourly'
+        include_stats: Чи включати статистику (min, max, mean, std)
+    """
+    if HISTORICAL_DATA_HOURLY is None or HISTORICAL_DATA_DAILY is None:
+        raise HTTPException(status_code=503, detail="Історичні дані не завантажено.")
+
+    if granularity == "hourly":
+        data = HISTORICAL_DATA_HOURLY['Global_active_power'].tail(days * 24)
+        values = {str(idx): float(val) for idx, val in data.items()}
+    else:  # daily
+        data = HISTORICAL_DATA_DAILY['Global_active_power'].tail(days)
+        values = {str(idx.date()): float(val) for idx, val in data.items()}
+
+    result = {
+        "granularity": granularity,
+        "period_days": days,
+        "data_points": len(values),
+        "date_range": {
+            "start": str(data.index.min()),
+            "end": str(data.index.max())
+        },
+        "values": values
+    }
+
+    if include_stats:
+        result["statistics"] = {
+            "min": float(data.min()),
+            "max": float(data.max()),
+            "mean": float(data.mean()),
+            "std": float(data.std()),
+            "median": float(data.median())
+        }
+
+    return result
+
+
+def get_features_service(model_id: str) -> Dict[str, Any]:
+    """
+    Повертає інформацію про ознаки, які використовує конкретна модель.
+
+    Args:
+        model_id: ID моделі
+    """
+    if model_id not in AVAILABLE_MODELS:
+        raise HTTPException(status_code=404, detail=f"Модель '{model_id}' не знайдена.")
+
+    model_config = AVAILABLE_MODELS[model_id]
+    model = MODELS_CACHE.get(model_id)
+
+    feature_info = {
+        "model_id": model_id,
+        "type": model_config["type"],
+        "granularity": model_config["granularity"],
+        "feature_set": model_config["feature_set"],
+        "supports_conditions": model_config.get("supports_conditions", False),
+    }
+
+    # Отримуємо список ознак з моделі
+    if model and hasattr(model, 'feature_names_in_'):
+        feature_names = list(model.feature_names_in_)
+        feature_info["feature_names"] = feature_names
+        feature_info["feature_count"] = len(feature_names)
+
+        # Групуємо ознаки за категоріями
+        categories = {
+            "weather": ["temperature", "humidity", "wind_speed"],
+            "calendar": ["is_holiday", "is_weekend"],
+            "time": ["hour", "day_of_week", "day_of_month", "day_of_year",
+                     "week_of_year", "month", "year", "quarter"],
+            "energy": ["Voltage", "Global_reactive_power", "Global_intensity"],
+            "zone_consumption": ["Sub_metering_1", "Sub_metering_2", "Sub_metering_3"],
+            "anomaly": ["is_anomaly"],
+        }
+
+        available_conditions = {}
+        for category, features in categories.items():
+            available_features = [f for f in features if f in feature_names]
+            if available_features:
+                available_conditions[category] = available_features
+
+        feature_info["available_conditions"] = available_conditions
+
+    elif model_config["feature_set"] == "none":
+        feature_info["feature_names"] = []
+        feature_info["feature_count"] = 0
+        feature_info["available_conditions"] = {}
+        feature_info["note"] = "Ця модель не використовує зовнішні ознаки (автономна модель часових рядів)."
+
+    else:
+        feature_info["feature_names"] = None
+        feature_info["note"] = "Модель не завантажена або не має інформації про ознаки."
+
+    return feature_info
