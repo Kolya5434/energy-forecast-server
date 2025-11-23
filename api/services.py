@@ -1127,6 +1127,8 @@ def get_patterns_service(period: str = "daily") -> Dict[str, Any]:
         # Патерн по тижнях року
         weekly_data = data.resample('W').sum()
         weekly_pattern = weekly_data.groupby(weekly_data.index.isocalendar().week).agg(['mean', 'std'])
+        # Replace NaN/inf with 0 to avoid JSON serialization errors
+        weekly_pattern = weekly_pattern.fillna(0).replace([float('inf'), float('-inf')], 0)
         result["pattern"] = {
             str(week): {"mean": float(row['mean']), "std": float(row['std'])}
             for week, row in weekly_pattern.iterrows()
@@ -1152,7 +1154,7 @@ def get_patterns_service(period: str = "daily") -> Dict[str, Any]:
 
     elif period == "yearly":
         # Патерн по роках
-        yearly_data = data.resample('Y').sum()
+        yearly_data = data.resample('YE').sum()
         result["pattern"] = {
             str(date.year): float(val)
             for date, val in yearly_data.items()
