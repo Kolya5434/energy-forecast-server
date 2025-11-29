@@ -23,8 +23,18 @@ from .schemas import (
 from .features import generate_simple_features, generate_full_features, create_sequences_for_dl
 from .evaluation import evaluate_model
 
+# ============================================================================
+# TensorFlow Optimizations
+# ============================================================================
+# Enable XLA JIT compilation for 2-3x speedup on DL models
+tf.config.optimizer.set_jit(True)
+
+# Configure TensorFlow to use available threads efficiently
+tf.config.threading.set_intra_op_parallelism_threads(4)
+tf.config.threading.set_inter_op_parallelism_threads(2)
 
 logger = logging.getLogger(__name__)
+logger.info("TensorFlow optimizations enabled: XLA JIT=True")
 
 
 def _apply_weather_conditions(X_future: pd.DataFrame, weather: WeatherConditions) -> pd.DataFrame:
