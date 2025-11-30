@@ -415,6 +415,39 @@ async def export_latex(request: LaTeXExportRequest):
                 stat_results = perform_statistical_comparison(predictions_dict, y_true)
                 latex_code = generate_statistical_tests_table(stat_results.get("pairwise_tests", {}))
 
+            elif export_type == "feature_importance":
+                from .latex_generator import generate_feature_importance_table
+
+                # Get feature importances from specified models
+                model_ids = request.model_ids or list(services.MODELS_CACHE.keys())
+
+                for model_id in model_ids:
+                    model = services.MODELS_CACHE.get(model_id)
+                    if not model:
+                        continue
+
+                    # Extract feature importances
+                    feature_importances = {}
+                    if hasattr(model, 'feature_importances_'):
+                        feature_names = model.feature_names_in_ if hasattr(model, 'feature_names_in_') else [f"Feature_{i}" for i in range(len(model.feature_importances_))]
+                        feature_importances = dict(zip(feature_names, model.feature_importances_))
+                    elif hasattr(model, 'coef_'):
+                        # Linear models
+                        feature_names = model.feature_names_in_ if hasattr(model, 'feature_names_in_') else [f"Feature_{i}" for i in range(len(model.coef_))]
+                        feature_importances = dict(zip(feature_names, np.abs(model.coef_)))
+
+                    if feature_importances:
+                        latex_code += generate_feature_importance_table(
+                            feature_importances,
+                            top_n=20,
+                            caption=f"Top 20 Feature Importances: {model_id}",
+                            label=f"tab:features_{model_id.lower().replace(' ', '_')}"
+                        )
+                        latex_code += "\n\\vspace{1cm}\n\n"
+
+                if not latex_code:
+                    latex_code = "% No models with feature importance available\n"
+
             elif export_type == "full_document":
                 # Collect metrics
                 metrics_dict = {}
