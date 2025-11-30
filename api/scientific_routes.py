@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException
 from starlette.concurrency import run_in_threadpool
 from typing import Dict, Any
 import logging
+import numpy as np
 
 from .schemas_scientific import (
     StatisticalTestRequest, StatisticalTestResponse,
@@ -128,13 +129,25 @@ async def perform_statistical_tests(request: StatisticalTestRequest):
     try:
         def _execute():
             predictions_dict = {}
+            y_true_dict = {}
 
+            # Get test data for all models
             for model_id in request.model_ids:
                 y_true, y_pred, timestamps = _get_test_data(model_id, request.test_size_days)
                 predictions_dict[model_id] = y_pred
+                y_true_dict[model_id] = y_true
 
-            # All models should have same y_true
-            y_true, _, _ = _get_test_data(request.model_ids[0], request.test_size_days)
+            # Check if all models have same length predictions
+            lengths = [len(preds) for preds in predictions_dict.values()]
+            if len(set(lengths)) > 1:
+                raise ValueError(
+                    f"Models have different prediction lengths: {dict(zip(request.model_ids, lengths))}. "
+                    f"Cannot compare models with different granularities. "
+                    f"Please select models with the same granularity (all daily or all hourly)."
+                )
+
+            # Use y_true from first model (all should be equivalent)
+            y_true = y_true_dict[request.model_ids[0]]
 
             results = perform_statistical_comparison(predictions_dict, y_true)
             return results
@@ -284,6 +297,70 @@ async def generate_visualization(request: VisualizationRequest):
                     predictions_dict[model_id] = y_pred
 
                 plot_base64 = plot_forecast_comparison(y_true, predictions_dict, timestamps)
+
+            elif viz_type == "temporal_error":
+                if not request.model_ids or len(request.model_ids) == 0:
+                    raise ValueError("model_ids required for temporal_error plot")
+
+                model_id = request.model_ids[0]
+                y_true, y_pred, timestamps = _get_test_data(model_id, request.test_size_days)
+                errors = np.abs(y_true - y_pred)
+                plot_base64 = plot_temporal_error_analysis(errors, timestamps, model_id)
+
+            elif viz_type == "feature_importance":
+                if not request.model_ids or len(request.model_ids) == 0:
+                    raise ValueError("model_ids required for feature_importance plot")
+
+                model_id = request.model_ids[0]
+                model = services.MODELS_CACHE.get(model_id)
+                if not model:
+                    raise ValueError(f"Model {model_id} not loaded")
+
+                # Get feature importances
+                if hasattr(model, 'feature_importances_'):
+                    importances = model.feature_importances_
+                    feature_names = model.feature_names_in_ if hasattr(model, 'feature_names_in_') else [f"Feature {i}" for i in range(len(importances))]
+                    plot_base64 = plot_feature_importance(feature_names, importances, top_n=20, model_name=model_id)
+                elif hasattr(model, 'coef_'):
+                    # Linear models
+                    importances = np.abs(model.coef_)
+                    feature_names = model.feature_names_in_ if hasattr(model, 'feature_names_in_') else [f"Feature {i}" for i in range(len(importances))]
+                    plot_base64 = plot_feature_importance(feature_names, importances, top_n=20, model_name=model_id)
+                else:
+                    raise ValueError(f"Model {model_id} does not support feature importance")
+
+            elif viz_type == "correlation":
+                # Generate correlation matrix from recent predictions and features
+                import pandas as pd
+                import numpy as np
+
+                if not request.model_ids or len(request.model_ids) == 0:
+                    # Use first available model
+                    model_ids = list(services.MODELS_CACHE.keys())[:3]
+                else:
+                    model_ids = request.model_ids
+
+                # Collect predictions and errors from multiple models
+                data_dict = {}
+                for model_id in model_ids:
+                    try:
+                        y_true, y_pred, timestamps = _get_test_data(model_id, request.test_size_days)
+                        errors = np.abs(y_true - y_pred)
+                        data_dict[f"{model_id}_pred"] = y_pred
+                        data_dict[f"{model_id}_error"] = errors
+                    except Exception as e:
+                        logger.warning(f"Could not get data for {model_id}: {e}")
+                        continue
+
+                # Add actual values
+                if data_dict:
+                    data_dict["Actual"] = y_true
+
+                if not data_dict:
+                    raise ValueError("No data available for correlation matrix")
+
+                df = pd.DataFrame(data_dict)
+                plot_base64 = plot_correlation_matrix(df, title="Prediction and Error Correlation Matrix")
 
             else:
                 raise ValueError(f"Unsupported visualization type: {viz_type}")

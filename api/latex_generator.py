@@ -355,9 +355,14 @@ def generate_full_latex_document(
     metrics_table = generate_metrics_table(metrics_dict)
     statistical_table = generate_statistical_tests_table(statistical_tests)
 
-    # Find best model
-    best_model = max(metrics_dict.items(), key=lambda x: x[1].get('r2', 0))[0]
-    best_metrics = metrics_dict[best_model]
+    # Find best model (handle empty metrics_dict)
+    if metrics_dict:
+        best_model = max(metrics_dict.items(), key=lambda x: x[1].get('r2', 0))[0]
+        best_metrics = metrics_dict[best_model]
+    else:
+        # Fallback when no metrics available
+        best_model = "N/A"
+        best_metrics = {"mae": 0, "rmse": 0, "mape": 0, "r2": 0}
 
     latex += generate_results_section(metrics_table, statistical_table, best_model, best_metrics)
 
