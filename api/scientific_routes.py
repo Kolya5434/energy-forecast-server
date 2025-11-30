@@ -329,6 +329,8 @@ async def generate_visualization(request: VisualizationRequest):
                 plot_base64 = plot_forecast_comparison(y_true, predictions_dict, timestamps)
 
             elif viz_type == "temporal_error":
+                import numpy as np
+
                 if not request.model_ids or len(request.model_ids) == 0:
                     raise ValueError("model_ids required for temporal_error plot")
 
@@ -370,24 +372,37 @@ async def generate_visualization(request: VisualizationRequest):
                 else:
                     model_ids = request.model_ids
 
-                # Collect predictions and errors from multiple models
+                # Collect predictions and errors from multiple models and validate lengths
                 data_dict = {}
+                lengths = {}
+                y_true_final = None
+
                 for model_id in model_ids:
                     try:
                         y_true, y_pred, timestamps = _get_test_data(model_id, request.test_size_days)
                         errors = np.abs(y_true - y_pred)
                         data_dict[f"{model_id}_pred"] = y_pred
                         data_dict[f"{model_id}_error"] = errors
+                        lengths[model_id] = len(y_pred)
+                        if y_true_final is None:
+                            y_true_final = y_true
                     except Exception as e:
                         logger.warning(f"Could not get data for {model_id}: {e}")
                         continue
 
-                # Add actual values
-                if data_dict:
-                    data_dict["Actual"] = y_true
-
                 if not data_dict:
                     raise ValueError("No data available for correlation matrix")
+
+                # Check if all models have same length
+                if len(set(lengths.values())) > 1:
+                    raise ValueError(
+                        f"Models have different prediction lengths: {lengths}. "
+                        f"Cannot compare models with different granularities. "
+                        f"Please select models with the same granularity (all daily or all hourly)."
+                    )
+
+                # Add actual values
+                data_dict["Actual"] = y_true_final
 
                 df = pd.DataFrame(data_dict)
                 plot_base64 = plot_correlation_matrix(df, title="Prediction and Error Correlation Matrix")
