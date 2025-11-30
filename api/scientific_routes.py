@@ -268,9 +268,19 @@ async def generate_visualization(request: VisualizationRequest):
                     raise ValueError("model_ids required for error distribution plot")
 
                 errors_dict = {}
+                lengths = {}
                 for model_id in request.model_ids:
                     y_true, y_pred, _ = _get_test_data(model_id, request.test_size_days)
                     errors_dict[model_id] = abs(y_true - y_pred)
+                    lengths[model_id] = len(y_pred)
+
+                # Check if all models have same length
+                if len(set(lengths.values())) > 1:
+                    raise ValueError(
+                        f"Models have different prediction lengths: {lengths}. "
+                        f"Cannot compare models with different granularities. "
+                        f"Please select models with the same granularity (all daily or all hourly)."
+                    )
 
                 plot_base64 = plot_error_distribution(errors_dict)
 
@@ -290,11 +300,31 @@ async def generate_visualization(request: VisualizationRequest):
                 if not request.model_ids:
                     raise ValueError("model_ids required for forecast plot")
 
-                y_true, _, timestamps = _get_test_data(request.model_ids[0], request.test_size_days)
-                predictions_dict = {}
+                # Get data for all models and validate lengths
+                data_dict = {}
+                lengths = {}
                 for model_id in request.model_ids:
-                    _, y_pred, _ = _get_test_data(model_id, request.test_size_days)
-                    predictions_dict[model_id] = y_pred
+                    y_true, y_pred, timestamps = _get_test_data(model_id, request.test_size_days)
+                    data_dict[model_id] = {
+                        'y_true': y_true,
+                        'y_pred': y_pred,
+                        'timestamps': timestamps
+                    }
+                    lengths[model_id] = len(y_pred)
+
+                # Check if all models have same length
+                if len(set(lengths.values())) > 1:
+                    raise ValueError(
+                        f"Models have different prediction lengths: {lengths}. "
+                        f"Cannot compare models with different granularities. "
+                        f"Please select models with the same granularity (all daily or all hourly)."
+                    )
+
+                # Use data from first model (all should be equivalent)
+                first_model = request.model_ids[0]
+                y_true = data_dict[first_model]['y_true']
+                timestamps = data_dict[first_model]['timestamps']
+                predictions_dict = {mid: data_dict[mid]['y_pred'] for mid in request.model_ids}
 
                 plot_base64 = plot_forecast_comparison(y_true, predictions_dict, timestamps)
 
