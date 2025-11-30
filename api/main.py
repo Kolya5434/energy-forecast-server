@@ -8,6 +8,12 @@ from starlette.concurrency import run_in_threadpool
 
 from fastapi.responses import JSONResponse
 
+# Import scientific routes
+from .scientific_routes import router as scientific_router
+
+# Include scientific routes
+app.include_router(scientific_router)
+
 # --- Exception Handler ---
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
