@@ -321,27 +321,17 @@ async def generate_visualization(request: VisualizationRequest):
                 if not request.model_ids:
                     raise ValueError("model_ids required for forecast plot")
 
-                # Get data for all models and validate lengths
+                # Aggregate all models to daily for fair comparison
                 data_dict = {}
-                lengths = {}
                 for model_id in request.model_ids:
-                    y_true, y_pred, timestamps, _ = _get_test_data(model_id, request.test_size_days)
+                    y_true, y_pred, timestamps, _ = _get_test_data(model_id, request.test_size_days, force_daily=True)
                     data_dict[model_id] = {
                         'y_true': y_true,
                         'y_pred': y_pred,
                         'timestamps': timestamps
                     }
-                    lengths[model_id] = len(y_pred)
 
-                # Check if all models have same length
-                if len(set(lengths.values())) > 1:
-                    raise ValueError(
-                        f"Models have different prediction lengths: {lengths}. "
-                        f"Cannot compare models with different granularities. "
-                        f"Please select models with the same granularity (all daily or all hourly)."
-                    )
-
-                # Use data from first model (all should be equivalent)
+                # Use data from first model (all should be equivalent after aggregation)
                 first_model = request.model_ids[0]
                 y_true = data_dict[first_model]['y_true']
                 timestamps = data_dict[first_model]['timestamps']
@@ -393,18 +383,16 @@ async def generate_visualization(request: VisualizationRequest):
                 else:
                     model_ids = request.model_ids
 
-                # Collect predictions and errors from multiple models and validate lengths
+                # Aggregate all models to daily for fair comparison
                 data_dict = {}
-                lengths = {}
                 y_true_final = None
 
                 for model_id in model_ids:
                     try:
-                        y_true, y_pred, timestamps, _ = _get_test_data(model_id, request.test_size_days)
+                        y_true, y_pred, timestamps, _ = _get_test_data(model_id, request.test_size_days, force_daily=True)
                         errors = np.abs(y_true - y_pred)
                         data_dict[f"{model_id}_pred"] = y_pred
                         data_dict[f"{model_id}_error"] = errors
-                        lengths[model_id] = len(y_pred)
                         if y_true_final is None:
                             y_true_final = y_true
                     except Exception as e:
@@ -413,14 +401,6 @@ async def generate_visualization(request: VisualizationRequest):
 
                 if not data_dict:
                     raise ValueError("No data available for correlation matrix")
-
-                # Check if all models have same length
-                if len(set(lengths.values())) > 1:
-                    raise ValueError(
-                        f"Models have different prediction lengths: {lengths}. "
-                        f"Cannot compare models with different granularities. "
-                        f"Please select models with the same granularity (all daily or all hourly)."
-                    )
 
                 # Add actual values
                 data_dict["Actual"] = y_true_final
