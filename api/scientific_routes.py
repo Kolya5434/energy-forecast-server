@@ -53,8 +53,18 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/scientific", tags=["Scientific Analysis"])
 
 
-def _get_test_data(model_id: str, test_size_days: int = 30):
-    """Helper to get test data for a model."""
+def _get_test_data(model_id: str, test_size_days: int = 30, force_daily: bool = False):
+    """
+    Helper to get test data for a model.
+
+    Args:
+        model_id: Model identifier
+        test_size_days: Number of days for test data
+        force_daily: If True, aggregate hourly predictions to daily for comparison
+
+    Returns:
+        y_true, y_pred, timestamps, granularity
+    """
     from sklearn.metrics import mean_absolute_error
     import pandas as pd
     import numpy as np
@@ -74,8 +84,10 @@ def _get_test_data(model_id: str, test_size_days: int = 30):
     if not model:
         raise ValueError(f"Model {model_id} not loaded")
 
+    granularity = model_config["granularity"]
+
     # Determine test data based on granularity
-    if model_config["granularity"] == "daily":
+    if granularity == "daily":
         test_data = historical_daily.tail(test_size_days)
         y_true = test_data['Global_active_power'].values
         timestamps = test_data.index
@@ -112,7 +124,25 @@ def _get_test_data(model_id: str, test_size_days: int = 30):
     y_pred = y_pred[:min_len]
     timestamps = timestamps[:min_len]
 
-    return y_true, y_pred, timestamps
+    # If force_daily and hourly data, aggregate to daily
+    if force_daily and granularity == "hourly":
+        df = pd.DataFrame({
+            'timestamp': timestamps,
+            'y_true': y_true,
+            'y_pred': y_pred
+        })
+        df['date'] = pd.to_datetime(df['timestamp']).dt.date
+        daily_agg = df.groupby('date').agg({
+            'y_true': 'sum',
+            'y_pred': 'sum'
+        }).reset_index()
+
+        y_true = daily_agg['y_true'].values
+        y_pred = daily_agg['y_pred'].values
+        timestamps = pd.to_datetime(daily_agg['date'])
+        granularity = "daily"
+
+    return y_true, y_pred, timestamps, granularity
 
 
 @router.post("/statistical-tests", response_model=StatisticalTestResponse)
@@ -133,7 +163,7 @@ async def perform_statistical_tests(request: StatisticalTestRequest):
 
             # Get test data for all models
             for model_id in request.model_ids:
-                y_true, y_pred, timestamps = _get_test_data(model_id, request.test_size_days)
+                y_true, y_pred, timestamps, _ = _get_test_data(model_id, request.test_size_days)
                 predictions_dict[model_id] = y_pred
                 y_true_dict[model_id] = y_true
 
@@ -174,7 +204,7 @@ async def perform_residual_analysis_endpoint(request: ResidualAnalysisRequest):
     """
     try:
         def _execute():
-            y_true, y_pred, timestamps = _get_test_data(request.model_id, request.test_size_days)
+            y_true, y_pred, timestamps, _ = _get_test_data(request.model_id, request.test_size_days)
 
             results = analyze_residuals(y_true, y_pred, timestamps)
             results["model_id"] = request.model_id
@@ -210,7 +240,7 @@ async def perform_error_analysis_endpoint(request: ErrorAnalysisRequest):
     """
     try:
         def _execute():
-            y_true, y_pred, timestamps = _get_test_data(request.model_id, request.test_size_days)
+            y_true, y_pred, timestamps, _ = _get_test_data(request.model_id, request.test_size_days)
 
             results = perform_error_analysis(
                 y_true, y_pred,
@@ -259,7 +289,7 @@ async def generate_visualization(request: VisualizationRequest):
                     raise ValueError("model_ids required for residuals plot")
 
                 model_id = request.model_ids[0]
-                y_true, y_pred, timestamps = _get_test_data(model_id, request.test_size_days)
+                y_true, y_pred, timestamps, _ = _get_test_data(model_id, request.test_size_days)
                 residuals = y_true - y_pred
                 plot_base64 = plot_residual_analysis(residuals, y_pred, timestamps, model_id)
 
@@ -267,20 +297,11 @@ async def generate_visualization(request: VisualizationRequest):
                 if not request.model_ids:
                     raise ValueError("model_ids required for error distribution plot")
 
+                # Aggregate all models to daily for fair comparison
                 errors_dict = {}
-                lengths = {}
                 for model_id in request.model_ids:
-                    y_true, y_pred, _ = _get_test_data(model_id, request.test_size_days)
+                    y_true, y_pred, _, _ = _get_test_data(model_id, request.test_size_days, force_daily=True)
                     errors_dict[model_id] = abs(y_true - y_pred)
-                    lengths[model_id] = len(y_pred)
-
-                # Check if all models have same length
-                if len(set(lengths.values())) > 1:
-                    raise ValueError(
-                        f"Models have different prediction lengths: {lengths}. "
-                        f"Cannot compare models with different granularities. "
-                        f"Please select models with the same granularity (all daily or all hourly)."
-                    )
 
                 plot_base64 = plot_error_distribution(errors_dict)
 
@@ -304,7 +325,7 @@ async def generate_visualization(request: VisualizationRequest):
                 data_dict = {}
                 lengths = {}
                 for model_id in request.model_ids:
-                    y_true, y_pred, timestamps = _get_test_data(model_id, request.test_size_days)
+                    y_true, y_pred, timestamps, _ = _get_test_data(model_id, request.test_size_days)
                     data_dict[model_id] = {
                         'y_true': y_true,
                         'y_pred': y_pred,
@@ -335,7 +356,7 @@ async def generate_visualization(request: VisualizationRequest):
                     raise ValueError("model_ids required for temporal_error plot")
 
                 model_id = request.model_ids[0]
-                y_true, y_pred, timestamps = _get_test_data(model_id, request.test_size_days)
+                y_true, y_pred, timestamps, _ = _get_test_data(model_id, request.test_size_days)
                 errors = np.abs(y_true - y_pred)
                 plot_base64 = plot_temporal_error_analysis(errors, timestamps, model_id)
 
@@ -379,7 +400,7 @@ async def generate_visualization(request: VisualizationRequest):
 
                 for model_id in model_ids:
                     try:
-                        y_true, y_pred, timestamps = _get_test_data(model_id, request.test_size_days)
+                        y_true, y_pred, timestamps, _ = _get_test_data(model_id, request.test_size_days)
                         errors = np.abs(y_true - y_pred)
                         data_dict[f"{model_id}_pred"] = y_pred
                         data_dict[f"{model_id}_error"] = errors
@@ -453,10 +474,10 @@ async def export_latex(request: LaTeXExportRequest):
             elif export_type == "statistical_tests":
                 predictions_dict = {}
                 for model_id in (request.model_ids or list(services.MODELS_CACHE.keys())[:3]):
-                    y_true, y_pred, _ = _get_test_data(model_id, 30)
+                    y_true, y_pred, _, _ = _get_test_data(model_id, 30)
                     predictions_dict[model_id] = y_pred
 
-                y_true, _, _ = _get_test_data(list(predictions_dict.keys())[0], 30)
+                y_true, _, _, _ = _get_test_data(list(predictions_dict.keys())[0], 30)
                 stat_results = perform_statistical_comparison(predictions_dict, y_true)
                 latex_code = generate_statistical_tests_table(stat_results.get("pairwise_tests", {}))
 
@@ -506,13 +527,13 @@ async def export_latex(request: LaTeXExportRequest):
                 model_subset = list(metrics_dict.keys())[:5]  # Limit to 5 models
                 for model_id in model_subset:
                     try:
-                        y_true, y_pred, _ = _get_test_data(model_id, 30)
+                        y_true, y_pred, _, _ = _get_test_data(model_id, 30)
                         predictions_dict[model_id] = y_pred
                     except:
                         continue
 
                 if predictions_dict:
-                    y_true, _, _ = _get_test_data(list(predictions_dict.keys())[0], 30)
+                    y_true, _, _, _ = _get_test_data(list(predictions_dict.keys())[0], 30)
                     stat_results = perform_statistical_comparison(predictions_dict, y_true)
                     statistical_tests = stat_results.get("pairwise_tests", {})
                 else:
@@ -621,7 +642,7 @@ async def get_model_diagnostics(model_id: str, test_size_days: int = 30):
     """
     try:
         def _execute():
-            y_true, y_pred, timestamps = _get_test_data(model_id, test_size_days)
+            y_true, y_pred, timestamps, _ = _get_test_data(model_id, test_size_days)
 
             diagnostics = {
                 "model_id": model_id,
